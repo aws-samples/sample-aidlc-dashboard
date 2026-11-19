@@ -27,7 +27,8 @@ server on Bun, and adds the usage panel described above.
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) — the version is under [Run from source](#run-from-source).
+- [Bun](https://bun.sh), to run from source or build the executable — not for a release install. The
+  version is under [Run from source](#run-from-source).
 - An AI-DLC workspace: a folder holding `aidlc/spaces/` (where AI-DLC keeps its records).
 - Optional: [Kiro CLI](https://kiro.dev) (`kiro-cli` on PATH) for the credit panel, or Claude Code
   transcripts under `~/.claude/projects/` for the token panel.
@@ -47,10 +48,41 @@ bun run src/server.ts --root ~/path/to/ws    # start on that workspace
 
 `Ctrl+C` stops it.
 
+## Install from a release
+
+A release carries one executable per platform with Bun inside it, so nothing else is needed. From
+the repository's **Releases** page, download into one folder:
+
+- the zip for your machine: `aidlc-dashboard-<version>-<target>.zip`, where `<target>` is
+  `darwin-arm64` (Apple Silicon), `darwin-x64` (Intel Mac), `linux-x64`, `linux-arm64` or
+  `windows-x64` (also for Windows on ARM, under emulation);
+- `install.sh` (macOS, Linux) or `install.ps1` (Windows);
+- `SHA256SUMS`.
+
+On macOS and Linux, in that folder:
+
+```bash
+shasum -a 256 -c SHA256SUMS --ignore-missing     # Linux: sha256sum -c SHA256SUMS --ignore-missing
+AIDLC_ARCHIVE=aidlc-dashboard-<version>-darwin-arm64.zip sh install.sh
+```
+
+The first line must print `OK` for your zip; if it does not, delete the download and do not install
+it. On Windows, in PowerShell in that folder, compare the hash with the zip's line in `SHA256SUMS`,
+then install:
+
+```powershell
+(Get-FileHash .\aidlc-dashboard-<version>-windows-x64.zip -Algorithm SHA256).Hash
+$env:AIDLC_ARCHIVE = ".\aidlc-dashboard-<version>-windows-x64.zip"
+Get-Content -Raw .\install.ps1 | iex
+```
+
+Where it is installed, how to start it and how to update are below: the installers are the same ones
+the build path uses.
+
 ## Build an executable (optional)
 
-No releases are published. If you want a single executable with Bun inside it, build it yourself
-from the clone and install it with the script in this repository:
+To build the executable yourself instead, from the clone, and install it with the script in this
+repository:
 
 ```bash
 bun run package dist --only darwin-arm64              # one target for this machine
@@ -67,8 +99,9 @@ aidlc-dashboard                       # folder picker
 aidlc-dashboard ~/path/to/workspace   # straight to that workspace
 ```
 
-To update, `git pull`, build and run the same command again: the install is replaced in place and
-the collected credit history (`data/usage.db`) is kept.
+To update, `git pull`, build and run the same command again — or, from a release, download the new
+zip and run the installer on it: the install is replaced in place and the collected credit history
+(`data/usage.db`) is kept.
 
 ### Windows
 
@@ -103,7 +136,7 @@ Set with environment variables (`$env:AIDLC_DIR = …` in PowerShell).
 
 | Variable | Meaning |
 |---|---|
-| `AIDLC_ARCHIVE` | The zip to install (the `dist/…zip` built above). Required: the installers download nothing |
+| `AIDLC_ARCHIVE` | The zip to install (a release download, or the `dist/…zip` built above). Required: the installers download nothing |
 | `AIDLC_DIR` | Install location (default `~/.aidlc-dashboard` on macOS and Linux, `%LOCALAPPDATA%\Programs\aidlc-dashboard` on Windows). When set, the Windows move from the older location is skipped |
 | `AIDLC_BIN_DIR` | (macOS, Linux) Folder for the launcher (default `~/.local/bin`) |
 | `AIDLC_NO_BIN=1` | (macOS, Linux) Do not create the launcher |
