@@ -44,10 +44,18 @@
  * `_kiro.dev/commands/execute` and replaces `/usage` with `_kiro/account/getUsage`. Measured on kiro-cli
  * 3.5.0 (2026-11-19):
  *
- *   | launch | `commands/execute` | `account/getUsage` |
- *   |---|---|---|
- *   | `kiro-cli acp` (nothing set) | V2 — works | -32601 Method not found |
- *   | `--agent-engine=v3` | -32603 Internal error | works, with no session and `{}` params |
+ *   | launch, `clientInfo.name` | server | `commands/execute` | `account/getUsage` |
+ *   |---|---|---|---|
+ *   | nothing set, `aidlc-dashboard` | V2 | works | -32601 Method not found |
+ *   | nothing set, any other name | V3 | — | — |
+ *   | `--agent-engine=v3`, `aidlc-dashboard` | V3 | -32603 Internal error | works, no session, `{}` |
+ *
+ * **The default is V3, and this client is kept on V2 by name.** The doc's exception "Kiro recognizes the
+ * client as one that still needs V2" matches `clientInfo.name` exactly, case-insensitively: `aidlc-dashboard`
+ * and `AIDLC-Dashboard` get V2, while `aidlc-dashboardx`, `my-aidlc-dashboard`, `aidlc`, `zed` and
+ * `test-client` get V3 (measured on 3.5.0, `initialize` alone). That is Kiro's accommodation, not a
+ * contract — it ends when Kiro drops the name, and `acp.agentEngine v3` overrides it already, since a
+ * named harness always wins. The name is not changed to steer the generation either way.
  *
  * So the argv names no engine: pinning one would break kiro-cli before 2.36 (no flag) or a Linux machine
  * that cannot run V3. Instead the generation is read from `initialize` (`isCliV3Server`) — never from
@@ -284,6 +292,7 @@ const INIT_PARAMS = {
     fs: { readTextFile: false, writeTextFile: false },
     terminal: false,
   },
+  // kiro-cli 3.5.0 starts V2 for exactly this name when nothing names an engine — see the header.
   clientInfo: { name: "aidlc-dashboard", version: "1" },
 } as const;
 
