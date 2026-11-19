@@ -1,0 +1,8 @@
+node_modules
+__backup
+/data/
+/dist/
+/CLAUDE.md
+/.claude/
+/AGENTS.md
+/MIGRATION.md

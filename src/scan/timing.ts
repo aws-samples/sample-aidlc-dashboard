@@ -1,0 +1,1797 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
+// Where the run's wall-clock actually went.
+//
+// PORTED from v2-patches/scripts/harness_timing_report.py (classify_gaps +
+// stage_table). That reader was corrected against three real runs, so the rules
+// below are transcribed rather than re-derived — including the two defects its
+// comments record, both of which a fresh implementation walks straight into:
+//
+//   1. Bootstrap stages (workspace-scaffold / workspace-detection / state-init)
+//      emit STARTED and COMPLETED in the SAME second. Filtering on `elapsed > 0`
+//      would mark completed stages as unfinished. Zero-second stages count.
+//   2. Measuring only COMPLETED stages hides the stage you most want to see —
+//      the one sitting at its approval gate. Its STARTED→AWAITING_APPROVAL span
+//      is already-settled work. So the end point is chosen
+//      COMPLETED > AWAITING_APPROVAL > last event in the ledger.
+//
+// WHY GAPS ARE CLASSIFIED AT ALL. Wall-clock is not a measure of the engine:
+// most of it is the engine waiting for a human at an approval gate (measured on
+// one run: 58 of 79 minutes). So each gap between consecutive events is sorted:
+//
+//   HUMAN  an asking row (a gate, a decision, an engine question) followed, on the
+//          SAME clone's rows, by one of the engine's answer receipts (GATE_CLOSE —
+//          HUMAN_TURN is only one of eight) that answers THAT ask: a turn that replied,
+//          a receipt for the same stage, unit and gate (`answersAsk`). Passive rows
+//          between the two (a file write, a sensor, an error, a session end, the host's
+//          own prompt, the question shown again) keep the ask open, and only the gap
+//          ending at the answer counts (`ASK_PASSIVE`). A merged gap counts while
+//          every present clone is waiting or parked (`askWaits`).
+//   PARKED every clone PRESENT at that moment is between WORKFLOW_PARKED and
+//          WORKFLOW_UNPARKED, plus an inferred session break when an old ledger has
+//          no balanced park pair.
+//   ACTIVE event-dense time (<5 minutes) and delegation windows.
+//   CONV   one clone's HUMAN_TURN straight to its own next HUMAN_TURN.
+//   UNKNOWN a 5-minute+ gap with no trustworthy semantic marker.
+//
+// ACTIVE is deliberately called "observed", not "actual execution": the ledger
+// records event boundaries, not CPU/model activity. UNKNOWN stays separate
+// instead of being presented as execution.
+//
+// READ THIS BEFORE TUNING THE TWO CONSTANTS BELOW. `observedSec + unknownSec` is
+// invariant under `SUSPECT_SEC` to three decimals — measured 55.689h across the
+// whole sweep 60s…∞ on one run. So the pair is one real quantity ("time no marker
+// explains") cut at an arbitrary point, and moving the cut moves UNKNOWN between
+// 38% and 0% of the wall clock without learning anything. Likewise `IDLE_FLOOR_SEC`
+// only trades humanWait against observed. Neither constant can create information;
+// what does is a rule that reads a marker the ledger actually carries — which is why
+// the park, gate-close and delegation rules were widened instead.
+//
+// CONVERSATION IS THE ONE THING THAT STRADDLED THAT ARBITRARY CUT. `HUMAN_TURN` →
+// the same clone's next `HUMAN_TURN`, nothing in between, measured 58 gaps / 4.72h on
+// one run and **same-shard in all 58**. It is one phenomenon that the 300s cut split
+// into 2.95h of UNKNOWN and 1.77h of OBSERVED, so naming it does not move the cut —
+// it removes a split the cut had invented, which is why it earns a bucket where a
+// constant tweak would not. What it must NOT do is pick a side: the span holds the
+// engine's chat reply (which emits no audit event) and the human reading and typing,
+// and the ledger draws no boundary between them. So it is neither idle nor work, and
+// it is excluded from `idleSec` and `workSec` both.
+
+import { type AuditEvent, type AuditLedger, cloneKeys, cloneOf, isReplyTurn } from "./audit";
+import { answeredBy as decisionAnsweredBy } from "./decision-wait";
+
+/**
+ * Events that open a human wait: after one of these, a gap to a receipt is IDLE.
+ *
+ * `QUESTION_ASKED` is an engine question with no row of its own — the code plan question,
+ * a question `next` asks (where the work belongs, who builds the Units, …), a held system
+ * install's go-ahead (2.11.4 audit-format.md). The engine lists it with the two gate rows
+ * as an asking row (`ASKING_ROWS`, aidlc-questions.ts) but decides nothing on it yet — its
+ * question ledger only stamps the open ids on the next turn — so reading it as a wait is
+ * THIS READER's reading, not a transcription (the owner's call, 2026-11-16). Measured
+ * over the local records: 65 rows in 21 records, 3.33h of wait across 62 answered asks.
+ */
+const GATE_OPEN = new Set(["DECISION_RECORDED", "STAGE_AWAITING_APPROVAL", "QUESTION_ASKED"]);
+
+/**
+ * Events that CLOSE a human wait — the engine's documented answer receipts. Every one
+ * of them requires a human to have acted, per `knowledge/aidlc-shared/audit-format.md`,
+ * which lists them among the "authority-bearing receipts" only their owning tool may
+ * emit. Reading only `HUMAN_TURN` here left three real waits in UNKNOWN:
+ *
+ *   STAGE_AWAITING_APPROVAL → GATE_APPROVED    a gate opened and a human approved it.
+ *                                             The most unambiguous wait the engine has,
+ *                                             and it was filed as unclassified.
+ *   DECISION_RECORDED → SUMMARY_CONFIRMATION_RECORDED
+ *                                             audit-format: the summary choice is
+ *                                             "recorded after the matching prompt AND A
+ *                                             FRESH HUMAN TURN", so the span contains a
+ *                                             human decision by definition.
+ *   DECISION_RECORDED → QUESTION_ANSWERED     the documented authorization triple is
+ *                                             `DECISION_RECORDED → HUMAN_TURN →
+ *                                             QUESTION_ANSWERED`; HUMAN_TURN is
+ *                                             "omitted when the driver declares
+ *                                             AIDLC_UNATTENDED=1", and the pair then
+ *                                             collapses to these two.
+ *
+ * Measured on one real run: UNKNOWN 6.78h → 5.90h, user wait 2.17h → 3.20h (+47%),
+ * with only 0.16h traded out of `observed`. The gate-open precondition stays — this
+ * widens WHAT CLOSES a wait, never what opens one.
+ *
+ * The set is the engine's `GATE_RESOLUTION_EVENTS` (`tools/aidlc-lib.ts`, 2.11.0) plus
+ * `HUMAN_TURN`: the three recorded answers it adds — verification command,
+ * construction policy, plan approval — are each written after a person chose.
+ */
+const GATE_CLOSE = new Set([
+  "HUMAN_TURN",
+  "GATE_APPROVED",
+  "GATE_REJECTED",
+  "QUESTION_ANSWERED",
+  "SUMMARY_CONFIRMATION_RECORDED",
+  "VERIFICATION_COMMAND_RECORDED",
+  "CONSTRUCTION_POLICY_RECORDED",
+  "PLAN_APPROVAL_RECORDED",
+]);
+
+/**
+ * Does receipt `b` answer the ask `a` opened? Being next to it is not enough — the
+ * rule used to read only the two event names, so another clone's turn, or a receipt
+ * for a different stage or unit, could close a wait it had nothing to do with. What
+ * it asks of the pair:
+ *
+ *   - SAME CLONE. `askWaits` pairs a clone's own rows, so this holds by construction;
+ *     the check stays for a direct caller. A dashboard reading, not an engine rule —
+ *     the engine's gate and decision readers pair across shards — because a turn on
+ *     another clone is another developer.
+ *   - A `HUMAN_TURN` that REPLIED (`isReplyTurn`, 2.11.4): `Reply: command` is only a
+ *     command to AIDLC, `Reply: question` only a question about a switch, and a turn
+ *     carrying `Open Question` was sent while an engine question was on screen and
+ *     answers THAT one (aidlc-lib.ts `OPEN_QUESTION_FIELD`: "a message sent while one was
+ *     open answers that one"). So for a gate or decision beneath it the turn is no reply;
+ *     for a `QUESTION_ASKED` whose `Question Type` is the ask type it names, it is (the
+ *     hook writes the marker's `ask_type`, `openEngineQuestion` in
+ *     aidlc-plan-approval-ask.ts). A turn that did reply shows the person came back; with
+ *     no `Open Question` it names no ask, so it is the nearest marker, not a proof that
+ *     THAT ask was answered.
+ *   - A gate (`STAGE_AWAITING_APPROVAL`) is answered by a `GATE_APPROVED`/
+ *     `GATE_REJECTED` for the same gate: same `Stage`, same `Unit` (both absent for a
+ *     stage gate), same `Gate Scope` (default `per-stage`) and, when both rows carry
+ *     one, the same `Attempt Generation` — the fields `unitGateStatus` matches on; the
+ *     claim attempt itself lives in checkout state this reader cannot see. A unit-end
+ *     gate is opened and approved on the final stage only (the writer refuses
+ *     otherwise), so `Stage` equality is enough there. A `Recovered: true` gate row
+ *     opens nothing: the approve-time backstop writes it while handling the approval,
+ *     not to ask (`pendingGate` skips it too). `Revalidated: true` does open: the gate
+ *     was already open, and the time after it is still the gate's.
+ *   - A `QUESTION_ASKED` is answered by the row the engine's question ledger closes it
+ *     with (`answered` in 2.11.4 aidlc-questions.ts, transcribed as `questionAnsweredBy`),
+ *     read for its `Question Type`, `Stage` and `Unit`.
+ *   - A decision (`DECISION_RECORDED`) is answered by a row of the same stage that
+ *     `decisionAnsweredBy` accepts — so a gate decision closes only the two
+ *     gate-answered checkpoints, with their key — and, when both carry a `Unit`, of
+ *     the same unit. The unit condition is this reader's: the engine's ordinary
+ *     pending-decision reader closes on any answer of the stage.
+ *
+ * Measured over the 150 records on this machine (4 of them multi-clone): of 676
+ * gate→receipt gaps, none crossed clones, and none of the 10 receipts that name a
+ * stage named another one. The other 666 end in a `HUMAN_TURN`, which names none, so
+ * whether those turns answered that ask is not something the ledger can show.
+ */
+function answersAsk(a: AuditEvent, b: AuditEvent): boolean {
+  if (a.shard !== b.shard) return false;
+  if (b.event === "HUMAN_TURN") {
+    if (a.event !== "QUESTION_ASKED") return isReplyTurn(b);
+    const reply = b.fields.Reply;
+    const open = b.fields["Open Question"];
+    return (
+      reply !== "command" &&
+      reply !== "question" &&
+      (open === undefined || open === a.fields["Question Type"])
+    );
+  }
+  if (a.event === "QUESTION_ASKED") return questionAnsweredBy(a, b);
+  if (!GATE_CLOSE.has(b.event)) return false;
+  const stage = a.fields.Stage;
+  if (stage === undefined || b.fields.Stage !== stage) return false;
+  if (a.event === "STAGE_AWAITING_APPROVAL") {
+    if (b.event !== "GATE_APPROVED" && b.event !== "GATE_REJECTED") return false;
+    const attempt = (e: AuditEvent) => e.fields["Attempt Generation"];
+    return (
+      a.fields.Unit === b.fields.Unit &&
+      (a.fields["Gate Scope"] ?? "per-stage") === (b.fields["Gate Scope"] ?? "per-stage") &&
+      (attempt(a) === undefined || attempt(b) === undefined || attempt(a) === attempt(b))
+    );
+  }
+  const unit = (e: AuditEvent) => e.fields.Unit;
+  if (unit(a) !== undefined && unit(b) !== undefined && unit(a) !== unit(b)) return false;
+  return decisionAnsweredBy(a, b);
+}
+
+/**
+ * Rows that may sit between an ask and its answer without ending the wait: none of
+ * them is the person, and none moves the run to a next step. The agent writes or edits
+ * a file after asking (the questions file itself, often), the sensors fire on that
+ * write, an engine call errors, or the session ends while the person is away. Measured
+ * over the local records before this rule (2026-11-16, D2): 116 ask→answer pairs in 24
+ * records had one of these between them — session end 57, sensor 111, artifact 63,
+ * error 35 rows — and their 32.5h went to unclassified, because only an ask directly
+ * followed by its answer was read as a wait.
+ *
+ * Only the LAST gap, from the row before the answer to the answer, is counted as the
+ * wait (the owner's call, 2026-11-16: option A of three). The gaps before it end at a
+ * row the agent or a hook wrote, so the agent was still at work across them, and they
+ * are classified as any other gap is. Anything else between ends the wait — a session
+ * starting, a stage moving, a review, another receipt — since the ledger can no longer
+ * show the person was the one the run waited on.
+ */
+const ASK_PASSIVE = new Set([
+  "SESSION_ENDED",
+  // Written beside a system-install QUESTION_ASKED: the asking itself, not an answer.
+  "SYSTEM_INSTALL_BLOCKED",
+  "SENSOR_FIRED",
+  "SENSOR_PASSED",
+  "SENSOR_FAILED",
+  "SENSOR_COULD_NOT_RUN",
+  "SENSOR_BUDGET_OVERRIDE",
+  "ARTIFACT_CREATED",
+  "ARTIFACT_UPDATED",
+  "ERROR_LOGGED",
+  // The host's own prompt for the agent (a scheduled wake-up, a background task's
+  // notice), never a person's turn, and a still-open question shown again in another
+  // chat (2.11.4). Neither answers or moves the run (the owner's call, 2026-11-16).
+  "HOST_TURN",
+  "QUESTION_SHOWN",
+]);
+
+/** 2.11.4 aidlc-questions.ts `ENGINE_ASK_TYPES`: the engine's asks other than the code plan question. */
+const ENGINE_ASK_TYPES = new Set([
+  "scope-confirm",
+  "compose-offer",
+  "intent-pick",
+  "unit-paused",
+  "new-work-routing",
+  "project-type",
+  "construction-staffing",
+  "repo-scope",
+  "units-repos",
+  "unit-plan-change",
+  "guard-recovery",
+  "unit-claim",
+  "legacy-plan-approval-recovery",
+  "team-handover",
+]);
+
+/** 2.11.4 aidlc-questions.ts `CHECKPOINT_TYPES`, the entries a QUESTION_ASKED type can meet. */
+const CHECKPOINT_TYPES: Readonly<Record<string, string>> = {
+  "Code Generation Plan Approval": "plan-approval",
+  "plan-approval": "plan-approval",
+};
+
+/**
+ * Does row `b` close the question `QUESTION_ASKED` row `a` asked? The engine's `answered`
+ * (2.11.4 aidlc-questions.ts), transcribed for the question types this row carries —
+ * `plan-approval`, an engine ask type, `system-install` — the types the QUESTION_ASKED
+ * writers emit (2.11.4 audit-format.md). It is NOT the whole of `answered`: a type no
+ * writer puts on this row (`verification-command`, say) closes on nothing here, where the
+ * engine would close it. The stage's own question types and gates are asked by the other
+ * two opening rows. A row naming no `Stage` matches any
+ * stage, as the engine's `ofStage` reads it.
+ */
+function questionAnsweredBy(a: AuditEvent, b: AuditEvent): boolean {
+  const type = a.fields["Question Type"] ?? "";
+  const stage = b.fields.Stage;
+  const unit = b.fields.Unit;
+  const checkpoint = b.fields.Checkpoint;
+  const ofStage = stage === undefined || a.fields.Stage === stage;
+  switch (b.event) {
+    case "GATE_APPROVED":
+    case "GATE_REJECTED":
+      if (checkpoint !== undefined)
+        return (
+          CHECKPOINT_TYPES[checkpoint] === type && (unit === undefined || a.fields.Unit === unit)
+        );
+      return (
+        b.event === "GATE_APPROVED" &&
+        type === "plan-approval" &&
+        ofStage &&
+        (unit === undefined || a.fields.Unit === unit)
+      );
+    case "PLAN_APPROVAL_RECORDED":
+    case "PLAN_APPROVAL_SKIPPED":
+    case "PLAN_APPROVAL_OVERRIDDEN":
+      return type === "plan-approval" && ofStage;
+    case "QUESTION_ANSWERED":
+      return checkpoint !== undefined && CHECKPOINT_TYPES[checkpoint] === type && ofStage;
+    case "SYSTEM_INSTALL_ALLOWED":
+      return type === "system-install";
+    case "REQUEST_ROUTED":
+      return ENGINE_ASK_TYPES.has(type);
+    default:
+      return false;
+  }
+}
+
+/**
+ * For each merged gap `i` (event i → i+1), the clones that are waiting on a person
+ * across it. A clone waits from its OWN row before an answer to that answer when the
+ * answer is to its open ask (`answersAsk`) and comes at least `IDLE_FLOOR_SEC` later.
+ * The ask stays open across the clone's `ASK_PASSIVE` rows and closes on any other —
+ * so with none between, this is the old adjacency rule. It is read on the clone's own
+ * rows instead of the merged ledger: there, one other clone's row between an ask and
+ * its answer made the wait vanish; here it does not, and the caller still counts a gap
+ * only when every PRESENT clone is waiting or parked, so a clone working through
+ * another's wait keeps that time out of it. An ask never answered stays out, as before.
+ */
+function askWaits(events: AuditEvent[]): (Set<string> | undefined)[] {
+  const waiting: (Set<string> | undefined)[] = [];
+  for (const p of askPairs(events)) {
+    if (!p.counted) continue;
+    for (let k = p.prev; k < p.answer; k++) {
+      let set = waiting[k];
+      if (!set) {
+        set = new Set();
+        waiting[k] = set;
+      }
+      set.add(events[p.answer]!.shard);
+    }
+  }
+  return waiting;
+}
+
+/**
+ * Every ask a clone's own later row answered, as indices into `events`: the ask, the
+ * clone's row just before the answer (the start of the one gap counted — `ASK_PASSIVE`),
+ * and the answer. `counted` says whether that gap reached `IDLE_FLOOR_SEC`. The single
+ * pairing pass both `askWaits` (the buckets) and `askAnswers` (the per-ask list) read, so
+ * the list and the split cannot disagree about which asks were answered.
+ */
+function askPairs(
+  events: AuditEvent[],
+): { ask: number; prev: number; answer: number; counted: boolean }[] {
+  const out: { ask: number; prev: number; answer: number; counted: boolean }[] = [];
+  const last = new Map<string, number>();
+  const ask = new Map<string, number>();
+  events.forEach((e, j) => {
+    const prev = last.get(e.shard);
+    last.set(e.shard, j);
+    const a = ask.get(e.shard);
+    if (opensWait(e)) ask.set(e.shard, j);
+    else if (!ASK_PASSIVE.has(e.event)) ask.delete(e.shard);
+    if (prev === undefined || a === undefined) return;
+    if (!answersAsk(events[a]!, e)) return;
+    out.push({ ask: a, prev, answer: j, counted: secs(events[prev]!.ts, e.ts) >= IDLE_FLOOR_SEC });
+  });
+  return out;
+}
+
+/** What kind of ask an `AskAnswer` was opened by. */
+export type AskKind = "gate" | "decision" | "question";
+
+/**
+ * One ask and the receipt that answered it, on the asking clone's own rows (`askPairs`).
+ * `waitSec` is the part of it counted as user wait on that clone — the last gap only, and
+ * only from `IDLE_FLOOR_SEC` (0 below it); `spanSec` is ask to answer, the passive rows
+ * between included. On a multi-clone run the merged split also drops a stretch another
+ * clone was working through, so these can sum higher than `total.humanWaitSec`.
+ */
+export interface AskAnswer {
+  kind: AskKind;
+  /** `Question Type` of a `QUESTION_ASKED`. */
+  questionType?: string;
+  stage?: string;
+  unit?: string;
+  askedAt: string;
+  answeredAt: string;
+  waitSec: number;
+  spanSec: number;
+  /** The answering row's event name. */
+  answeredBy: string;
+}
+
+export function askAnswers(events: AuditEvent[]): AskAnswer[] {
+  return askPairs(events).map((p) => {
+    const a = events[p.ask]!;
+    const b = events[p.answer]!;
+    return {
+      kind:
+        a.event === "STAGE_AWAITING_APPROVAL"
+          ? "gate"
+          : a.event === "QUESTION_ASKED"
+            ? "question"
+            : "decision",
+      questionType: a.event === "QUESTION_ASKED" ? a.fields["Question Type"] : undefined,
+      stage: a.fields.Stage ?? a.stage,
+      unit: a.fields.Unit ?? a.unit,
+      askedAt: a.ts,
+      answeredAt: b.ts,
+      waitSec: p.counted ? secs(events[p.prev]!.ts, b.ts) : 0,
+      spanSec: secs(a.ts, b.ts),
+      answeredBy: b.event,
+    };
+  });
+}
+
+/** A backfilled gate row: written while an approval is handled, not to ask. */
+function opensWait(e: AuditEvent): boolean {
+  return GATE_OPEN.has(e.event) && e.fields.Recovered !== "true";
+}
+
+/**
+ * Session-resume markers. A gap ENDING in one of these was the human being away,
+ * even with no gate event in front of it. Both are written by `hooks/aidlc-session-start.ts`
+ * when a session begins (`startup`/`clear` → STARTED, `resume` → RESUMED) — before any
+ * prompt — so a session that did start ends the long gap at its own row.
+ *
+ * `SESSION_RESUMED` is the taxonomy's own resume event — *"Existing Claude Code session
+ * resumed (source=resume)"* — and it was missing while its sibling `SESSION_STARTED` was
+ * present. A 40-minute gap closed by it therefore landed in unclassified instead of parked,
+ * which is the one event name where that misfiling is unambiguous.
+ *
+ * GUARDRAIL_LOADED and HEALTH_CHECKED were here too, from two runs where a 38- and a
+ * 43-minute gap ran SENSOR_PASSED → GUARDRAIL_LOADED and a human followed. They are not
+ * session rows: `collectDoctorReport` is their only writer (`DOCTOR_RUN_AUDIT_EVENTS`,
+ * aidlc-lib.ts — "doctor's receipt, not work"), and `--doctor` is a command anyone can run
+ * at any point, an agent included. Read as resumes they filed 33 gaps on the local
+ * records as inferred park (471.4h, most of the 574.5h inferred), with nothing recording a
+ * session; they now land where any other unexplained gap does.
+ */
+const SESSION_RESUME = new Set(["SESSION_STARTED", "SESSION_RESUMED"]);
+
+/** Merge-dispatch terminals: the agent returned, or the engine fell back to defaults. */
+const MERGE_DISPATCH_END = new Set(["MERGE_DISPATCH_RETURNED", "MERGE_DISPATCH_FALLBACK"]);
+
+/** Gaps shorter than this are not classified as waiting — they are just work. */
+const IDLE_FLOOR_SEC = 60;
+/** Unclassified gaps at or above this are surfaced for human judgement. */
+const SUSPECT_SEC = 300;
+
+/** Width of one time bin in `TimingReport.bins`. */
+export const BIN_SEC = 6 * 3600;
+
+/** Which bucket `classifyGaps` put one gap in. Delegated time is `observed`. */
+export type GapBucket = "humanWait" | "parked" | "observed" | "conversation" | "unknown";
+
+/**
+ * One fixed-width slice of the run window, holding the part of every classified gap
+ * that falls inside it. Bins are a RE-CUT of `TimingReport.total`, not a second
+ * classification: each gap keeps the bucket `classifyGaps` gave it and is split
+ * across bins by overlap, so a bucket summed over the bins equals that bucket in
+ * `total`.
+ */
+export interface TimeBin {
+  /** Bin start, ISO. The first bin starts on a local 00/06/12/18 boundary, the rest
+   *  follow in fixed `BIN_SEC` steps. */
+  start: string;
+  humanWaitSec: number;
+  parkedSec: number;
+  observedSec: number;
+  conversationSec: number;
+  unknownSec: number;
+}
+
+/** Per-stage workload tally — what the stage actually produced. */
+export interface Workload {
+  /** ARTIFACT_CREATED + ARTIFACT_UPDATED. */
+  artifacts: number;
+  /** SENSOR_FIRED. */
+  sensors: number;
+  /** SENSOR_FAILED. */
+  sensorFailures: number;
+  /**
+   * REVIEW_COMPLETED on this stage. It used to be SUBAGENT_COMPLETED, which in 2.11 carries
+   * `Agent Type` and no stage (`hooks/aidlc-log-subagent.ts`), so the by-stage count read 0
+   * everywhere — and counting it by time span instead put 160 on one unit-major stage
+   * of run E, whose span covers every later stage the units walked. A review names its
+   * stage; a subagent does not.
+   */
+  delegations: number;
+  /** HUMAN_TURN (no stage field, so counted within the span). */
+  humanTurns: number;
+}
+
+/** A long gap we refuse to classify confidently. */
+export interface SuspectSpan {
+  seconds: number;
+  fromEvent: string;
+  toEvent: string;
+  at: string;
+}
+
+export interface GapSplit {
+  /** A prompt/approval marker followed by the user's turn. */
+  humanWaitSec: number;
+  /** Explicit workflow park time, plus conservative inferred session breaks. */
+  parkedSec: number;
+  /** Park time inferred only from a session-resume marker. Subset of parkedSec. */
+  inferredParkSec: number;
+  /** Event-dense time and explicit delegation spans. */
+  observedSec: number;
+  /**
+   * Chat exchange — one clone's `HUMAN_TURN` straight to its own next `HUMAN_TURN`,
+   * with no engine event in between. See the CONVERSATION note above `classifyGaps`.
+   * Deliberately outside both `idleSec` and `workSec`: it holds the engine's unaudited
+   * reply AND the human reading it, and the ledger records no boundary between them.
+   */
+  conversationSec: number;
+  /** Long gaps with no trustworthy semantic classification. */
+  unknownSec: number;
+  /**
+   * The part of `unknownSec` whose gap ENDED in a person's message (`HUMAN_TURN`). Subset
+   * of unknownSec, kept so the panel can say how much of the unexplained time a message
+   * closed. It is not user wait: no ask is paired to it (`askWaits`), and the gap holds
+   * whatever happened before the person wrote — so it stays unclassified.
+   */
+  unknownToTurnSec: number;
+  /** Delegated time. Subset of observedSec. */
+  delegatedSec: number;
+  /** Unbalanced/repeated park markers encountered while classifying. */
+  parkAnomalies: number;
+  /** Long gaps kept visible instead of silently called execution. */
+  unknown: SuspectSpan[];
+  /** Compatibility aggregate: humanWaitSec + parkedSec. */
+  idleSec: number;
+  /** Compatibility alias for delegatedSec. */
+  agentSec: number;
+  /** Compatibility aggregate: observedSec + unknownSec. */
+  workSec: number;
+  /** Compatibility alias for unknown. */
+  suspect: SuspectSpan[];
+}
+
+/** How a stage's span was closed. */
+/**
+ * How a stage segment ended. `superseded` exists because a re-entry is not a state:
+ * when `STAGE_STARTED` arrives for a stage that is already open, the earlier segment
+ * is over and was replaced. Calling it `in-flight` (which it was, before this) left
+ * blue "in progress" bars sitting five days in the past on a real run — two of them — while
+ * the legend told the reader blue meant running now. Calling it `awaiting-approval`
+ * would be no better: the submission it refers to was rejected, and the rework block
+ * is where that belongs.
+ */
+export type StageEndKind =
+  | "completed"
+  | "skipped"
+  | "awaiting-approval"
+  | "in-flight"
+  | "superseded"
+  /** A unit segment closed by `UNIT_PAUSED` — unit spans only; a stage never pauses. */
+  | "paused";
+
+export interface StageSegment extends GapSplit {
+  startedAt: string;
+  endedAt: string;
+  endKind: StageEndKind;
+  elapsedSec: number;
+}
+
+export interface StageSpan extends GapSplit {
+  stage: string;
+  /** First segment start and last segment end, for the run-position track. */
+  startedAt: string;
+  endedAt: string;
+  endKind: StageEndKind;
+  /** Sum of entered segments, not first-start → last-end wall time. */
+  elapsedSec: number;
+  /** Separate entries after a backward jump; gaps between entries are excluded. */
+  segments: StageSegment[];
+  workload: Workload;
+}
+
+/**
+ * One unit's time in one per-unit stage, read from the unit lifecycle rows.
+ *
+ * WHY A SECOND VIEW. Under unit-major the engine keeps `Current Stage` on the block's
+ * first per-unit stage while the units walk the later ones (aidlc-orchestrate.ts), so
+ * that stage's `STAGE_STARTED → STAGE_COMPLETED` covers every later stage the units
+ * walked. A stage bar is calendar occupancy and says so; it cannot say how long each
+ * unit spent where. The ledger can: `UNIT_STARTED` / `UNIT_PAUSED` / `UNIT_RESUMED` /
+ * `UNIT_COMPLETED` / `UNIT_SKIPPED` carry `Stage` and `Unit` (audit-format.md), so a
+ * unit segment opens at a start or resume and closes at a pause or completion.
+ *
+ * A segment's split is classified on the events of the shard that opened it, inside its
+ * window — the shard is the clone that ran the unit, and under team ownership another
+ * clone's unit runs in the same hours. Whatever of the window that shard's events do not
+ * cover (a completion written on another clone, say) is unclassified, so the row still
+ * adds up. `UNIT_SKIPPED` closes an open segment and is otherwise a tick; a segment still
+ * open at the end ends at the last event, as a stage does. A second `UNIT_STARTED` for an
+ * open pair is a new attempt only when its `Run floor` differs — within one attempt the
+ * engine acknowledges a repeated start without writing a receipt (`unit start`,
+ * aidlc-state.ts) — and then the earlier segment is superseded. Two clones' rows for one
+ * pair in one second are causally unordered, so they are reduced as the engine reduces
+ * them (`crossShardTieLosers`): a possible pause wins, and a pause left with nothing open
+ * is a tick, because the engine reads that unit as paused.
+ *
+ * A RECEIPT CAN BE MINTED AFTER THE WORK. The protocol brackets a unit with `unit start`
+ * before its body (stage-protocol-construction.md, "Unit lifecycle receipts"), but when a
+ * unit's files and a fresh review exist without a receipt, `next` prints the receipt
+ * commands instead of the body (`unitReceiptOnlyStep`, aidlc-orchestrate.ts) — so both
+ * rows land at the end. Measured on a 2.10 tree: every code-generation unit had
+ * `UNIT_STARTED` 0–5s before `UNIT_COMPLETED`, while its writes ran over the 43 minutes
+ * before. Read literally, the view drew those units as 0 minutes. And a wave or recovery
+ * completion writes `UNIT_COMPLETED` with no start at all. So a segment starts at the
+ * pair's FIRST RECORD WRITE (`ARTIFACT_CREATED`/`_UPDATED`) when that comes earlier than
+ * its start receipt, or stands in for a missing one — within bounds the engine itself
+ * draws: the same shard, at or after the receipt's `Run floor` (the attempt boundary: a
+ * reopen, a jump that reaches the stage), and after the pair's last lifecycle row. Gates,
+ * decisions and reopen rows name the pair too but are not its work, so they never move a
+ * start. This is the earliest recorded evidence, not a measured start, and the screen
+ * says which segments rest on it (`startInferred`, with the receipt's own time). The end
+ * stays the receipt's: the view measures a unit's lifecycle THROUGH completion, and the
+ * unit checkpoint work after it (verification, the unit-end gate) is not in it.
+ */
+export interface UnitSegment extends StageSegment {
+  /** The start is the pair's first record write, not a start receipt. */
+  startInferred?: boolean;
+  /** The `UNIT_STARTED` time when the start was moved back; absent when there was none. */
+  receiptStartedAt?: string;
+  /** A completion with no start receipt and no record write: the duration is unknown. */
+  durationUnknown?: boolean;
+  /** A pause with nothing open: neither its start nor a completion was observed. */
+  pauseOnly?: boolean;
+}
+
+export interface UnitSpan extends GapSplit {
+  stage: string;
+  unit: string;
+  startedAt: string;
+  endedAt: string;
+  endKind: StageEndKind;
+  /** Sum of the segments, pauses excluded. */
+  elapsedSec: number;
+  segments: UnitSegment[];
+}
+
+/**
+ * One audit shard's own timeline — i.e. one clone, which in practice means one
+ * developer's machine.
+ *
+ * WHY THIS EXISTS. The gap rules above read a SINGLE sequence of events: a gap is
+ * idle because nothing happened in it. Merge four developers' shards into one
+ * sequence and that premise breaks — while A waits at a gate, B is working, so
+ * A's wait gets filled by B's events and is misread as work. Measured on a real
+ * 4-developer run: merged idle 818.7 min vs per-shard idle 2,631.5 min, so the
+ * merged view loses 69% of the waiting.
+ *
+ * That mechanism needs OVERLAPPING clones, and it is worth knowing how rare that
+ * is. On a 3-shard run whose windows overlap by 0.00h, only 2 of 4,629 adjacent
+ * pairs crossed shards and `humanWaitSec` came out identical in both views — the
+ * merged/per-shard delta there was not interleaving at all but the park bug (see
+ * `presentAt` in classifyGaps). After that fix the merged figure is the LARGER one,
+ * by the handover gaps: they stop the team but belong to no individual.
+ *
+ * So gaps are ALSO classified per shard, and that is the number to trust for
+ * "how long did people actually wait" — while merged answers "how long was the team
+ * not moving". Neither is a correction of the other.
+ */
+export interface WorkerSpan {
+  /** Shard basename, e.g. "jane-doe-c02ab1cd2ef3-0a1b2c3d4e5f.md". */
+  shard: string;
+  /** Human-ish label: the shard name minus the host/clone-id suffix. */
+  label: string;
+  /**
+   * The 12-hex clone id the shard name ends with. Two shards can share it — measured
+   * on a real run, `devbox-macbook-pro-local-1a2b3c4d5e6f` and
+   * `9f8e7d6c5b4a-1a2b3c4d5e6f` are the SAME working copy reached under two host
+   * identities. `label` throws the id away, so without this the panel counted 3
+   * clones (and called them "parallel development") where there were 2 developers.
+   */
+  cloneId?: string;
+  /** True when the shard's last park marker was never closed — it left parked. */
+  endedParked: boolean;
+  events: number;
+  firstTs: string;
+  lastTs: string;
+  /** First → last event for THIS shard. */
+  elapsedSec: number;
+  humanWaitSec: number;
+  parkedSec: number;
+  observedSec: number;
+  /**
+   * Must be carried here too, or the row does not add up. `classifyGaps` already
+   * computes it per shard; dropping it left `user wait + parked + observed + unclassified` short of
+   * the row's own span by exactly the conversation total — measured 4.72h of 28.38h on
+   * one shard, an unexplained hole in a table whose whole point is accounting.
+   */
+  conversationSec: number;
+  unknownSec: number;
+  /** Part of unknownSec whose gap ended at a HUMAN_TURN — see `GapSplit.unknownToTurnSec`. */
+  unknownToTurnSec: number;
+  delegatedSec: number;
+  /** Compatibility aggregates. */
+  idleSec: number;
+  agentSec: number;
+  workSec: number;
+  /** GATE_APPROVED count — identifies who drove the workflow. */
+  gatesApproved: number;
+  /** STAGE_COMPLETED count. */
+  stagesCompleted: number;
+  /** Stages this shard touched, most active first. */
+  stages: string[];
+  /** Units this shard touched (often empty — see the note in model/types.ts). */
+  units: string[];
+}
+
+export interface TimingReport {
+  /** Stages in first-seen (run) order. */
+  stages: StageSpan[];
+  /** Unit segments by (stage, unit), in first-start order. Empty when no unit row exists. */
+  units: UnitSpan[];
+  /**
+   * Gap split over the MERGED timeline. Correct for a single-clone run; for a
+   * parallel one it under-reports idle (see WorkerSpan). `parallel` below says
+   * which case this is.
+   */
+  total: GapSplit;
+  firstTs?: string;
+  /**
+   * End of the analysed window. For a run with a `WORKFLOW_COMPLETED` this is the
+   * last event; for one still open it is the read clock, NOT the last event — see
+   * `lastEventTs`.
+   */
+  lastTs?: string;
+  /**
+   * Timestamp of the last real event. Distinct from `lastTs` on purpose: an open
+   * run's window ends now, so `lastTs` advances on every refresh while nothing
+   * happens. A tree copied out of a run mid-flight (or one simply parked) shows
+   * exactly that, and reporting only `lastTs` would put a moving date on a record
+   * whose last activity is fixed.
+   */
+  lastEventTs?: string;
+  /**
+   * `lastTs − lastEventTs`: the stretch with no audit record at all. It is inside
+   * `elapsedSec` and outside every `GapSplit` bucket, so `total` + this = the window.
+   *
+   * That was NOT true when this field was introduced, and the bug is worth keeping
+   * on the record: a synthetic `ANALYSIS_NOW` event extended the list handed to
+   * `classifyGaps`, so the silence was charged to a bucket second for second —
+   * `unknownSec` measured 41.15h at the read and 473.15h eighteen days later, on a
+   * ledger that had not changed. The comment here claimed the opposite, and the test
+   * that was supposed to protect it passed because its fixture had a single shard,
+   * which sent the trailing gap to `parkedSec` instead of the `unknownSec` it
+   * asserted on. Classification now runs on real events only.
+   */
+  sinceLastEventSec: number;
+  /** Team wall-clock: first → last event across every shard. */
+  elapsedSec: number;
+  /**
+   * `total` re-cut into `BIN_SEC` slices from the first event to the LAST EVENT, for
+   * the time chart. Merged timeline, like `total` and the stage spans — see TimeBin.
+   * The silence after the last event gets no bins: it is in no bucket, so every bin
+   * there would read zero, and a tree opened months after its last event (the
+   * reference fixture: 1,073 bins against 6 recorded) would squeeze the whole run into
+   * one edge of the chart. `sinceLastEventSec` carries that stretch instead.
+   */
+  bins: TimeBin[];
+  /** Per-shard timelines, busiest first. One entry for a single-clone run. */
+  workers: WorkerSpan[];
+  /** Every answered ask, in ledger order — see `AskAnswer`. */
+  asks: AskAnswer[];
+  /** True when more than one shard carries events. Says nothing about concurrency. */
+  parallel: boolean;
+  /**
+   * Distinct clone ids among the shards — the count of working copies, which is the
+   * closest thing the ledger has to "how many developers". Can be lower than
+   * `workers.length` (see `WorkerSpan.cloneId`).
+   */
+  clones: number;
+  /**
+   * Σ pairwise overlap of the worker windows. **0 means the clones never worked at
+   * the same time** — the run was a sequential handover, not parallel development.
+   * Measured on a real 3-shard run: all three pairwise overlaps were 0.00h, while
+   * the panel called it parallel development and reported `parallelism` 0.985 as if the clones
+   * had been near-perfectly concurrent.
+   */
+  overlapSec: number;
+  /** Wall-clock inside the window that no shard covers — the handover gaps. */
+  handoverSec: number;
+  /** Σ per-worker idle. The trustworthy waiting figure. */
+  personIdleSec: number;
+  /** Σ per-worker work. */
+  personWorkSec: number;
+  personHumanWaitSec: number;
+  personParkedSec: number;
+  personObservedSec: number;
+  personConversationSec: number;
+  personUnknownSec: number;
+  /** Σ per-worker elapsed — person-time, not wall-clock. */
+  personElapsedSec: number;
+  /**
+   * personElapsedSec / elapsedSec. Reported ONLY when `overlapSec > 0`, because
+   * without overlap it measures nothing about concurrency: with non-overlapping
+   * windows it reduces to `1 − handoverSec / elapsedSec`, i.e. how much of the
+   * window the shards happen to tile. Measured on a run with zero overlap it read
+   * 0.985 — and fell to 0.228 when the same unchanged ledger was read 18 days later,
+   * because only the denominator follows the clock.
+   */
+  parallelism?: number;
+}
+
+function secs(a: string, b: string): number {
+  return (Date.parse(b) - Date.parse(a)) / 1000;
+}
+
+/**
+ * Indices `g` of the gaps `events[g] → events[g + 1]` that lie inside a delegation.
+ *
+ * DELEGATION IS A WINDOW, NOT AN ADJACENT PAIR. `REVIEW_REQUESTED` is followed by the
+ * artifacts the reviewer writes, so the close is several events later: measured, 52 of
+ * 61 delegation gaps closed on `ARTIFACT_UPDATED`, leaving an adjacency test to
+ * recognise 0.31h of a real 14.4h. So each open is paired with ITS close and every gap
+ * in between is marked. An unclosed open marks nothing, so a dangling request cannot
+ * swallow the rest of the run.
+ *
+ * WHAT PAIRS WITH WHAT is the engine's own correlation, because "the next close in the
+ * shard" was not one. The 2.11.0 ledger has two delegations:
+ *
+ *   REVIEW_REQUESTED → REVIEW_COMPLETED
+ *     as `reviewAttemptAccounting` (`tools/aidlc-lib.ts`) pairs them: one pending request
+ *     per (Stage, Reviewer, Unit, Workflow, Iteration), each new request replacing it — a
+ *     retry re-sends the id, a replacement mints one — and a completion closes it only
+ *     when it answers THAT request: the same `Request Id`, or for a legacy request with
+ *     none, no id on the completion either; and `Request Fingerprint` (else `Artifact
+ *     Fingerprint`) equal to the request's `Artifact Fingerprint`, as
+ *     `reviewCompletionMatchesRequest` requires. So the window opens at the last request
+ *     the completion answers. Under team ownership the engine reads only the current claim
+ *     attempt's rows; this view keeps every attempt's time instead, so the pending request
+ *     is held per `Attempt Generation` — a stale attempt's late request used to replace the
+ *     current one and drop its window. Not transcribed: the verdict and review-record
+ *     checks, which decide whether the review COUNTS, not when it ran.
+ *   MERGE_DISPATCH_INVOKED → _RETURNED | _FALLBACK
+ *     by `Bolt slug` plus, on a pinned Unit merge, `Pinned OID` + `Attempt Generation` +
+ *     `Pin Transaction`, taking the terminal after the LAST invocation. That identity was
+ *     2.11.0's `requireMergeDispatchDecision` (`tools/aidlc-unit.ts`); 2.11.4 removed it and
+ *     no engine reader pairs a dispatch by its pin any more — the writer still stamps the
+ *     fields (`aidlc-bolt.ts`), and the only pairing left is the doctor's (`aidlc-utility.ts`),
+ *     first unconsumed terminal per slug, which is how a row without the pin fields pairs.
+ *     A pinned pair is kept as this reader's tighter reading of the same windows.
+ *
+ * Neither is limited to one shard — the engine's readers are not, and dropping a copied
+ * shard's duplicates (scan/audit.ts) can leave a request in the original file and its
+ * completion only in the copy.
+ *
+ * `SUBAGENT_COMPLETED` closed windows before this, and `SUBAGENT_DISPATCHED`, bare
+ * `MERGE_DISPATCH` and `GATE_OPENED` were read as opens. Bare `MERGE_DISPATCH` and
+ * `GATE_OPENED` are not engine events. `SUBAGENT_DISPATCHED` is (2.11.4 audit-format.md),
+ * but like a subagent completion it names only an `Agent Type`, no request it opens or
+ * answers, so neither bounds a window. On run E the first of 227 completion rows cut each
+ * review short: 0.40h delegated against 1.05h paired.
+ */
+/** `aidlc-lib.ts` REVIEW_FINGERPRINT_RE and `aidlc-review-records.ts` REVIEW_REQUEST_ID_RE. */
+const REVIEW_FINGERPRINT_RE = /^sha256:[0-9a-f]{64}$/;
+const REVIEW_REQUEST_ID_RE = /^review:[0-9a-f]{32}$/;
+
+/**
+ * The shape checks of `reviewRequestBindingFromBlock` this reader transcribes: a request
+ * the engine cannot bind is no request — it takes over no pass and marks no boundary.
+ */
+export function bindableReviewRequest(e: AuditEvent): boolean {
+  const fp = e.fields["Artifact Fingerprint"];
+  const id = e.fields["Request Id"];
+  if (fp === undefined || !REVIEW_FINGERPRINT_RE.test(fp)) return false;
+  return id === undefined || REVIEW_REQUEST_ID_RE.test(id);
+}
+
+export interface ReviewPair {
+  /** Index of the `REVIEW_REQUESTED` the completion answers. */
+  request: number;
+  /** Index of the `REVIEW_COMPLETED`. */
+  completion: number;
+}
+
+export interface ReviewPairing {
+  pairs: ReviewPair[];
+  /**
+   * Requests no completion answered, one per review scope + pass, ascending by index. A
+   * retry or replacement took the pass over, so a replaced request is not here. This is
+   * the timing pairing's remainder, NOT the engine's current pending request: the engine
+   * also floors by attempt (jumps, re-entry, rejections), filters by claim and checks the
+   * review record, none of which happens here — model/agents.ts narrows it further.
+   */
+  pending: number[];
+}
+
+/**
+ * Review requests paired with the completions that answer them, by the rule described
+ * above `delegationGaps`. Exported so the Agents tab reads the SAME pairing the timing
+ * panel's delegated time is built from — a second reader would be a second, drifting
+ * answer to one question.
+ */
+export function pairReviews(events: readonly AuditEvent[]): ReviewPairing {
+  const field = (e: AuditEvent, name: string): string => e.fields[name] ?? "";
+  const reviews = new Map<string, number>(); // review scope + iteration → pending request
+  const pairs: ReviewPair[] = [];
+  events.forEach((e, i) => {
+    if (e.event !== "REVIEW_REQUESTED" && e.event !== "REVIEW_COMPLETED") return;
+    const iteration = field(e, "Iteration");
+    if (!/^[1-9][0-9]*$/.test(iteration)) return;
+    // `Attempt Generation` keeps two claim attempts apart: the engine reads only the
+    // current one (`reviewAttemptEventMatchesCurrentClaim`), so a stale generation's late
+    // request must not take over its pending request — and this view keeps both.
+    const key = ["Stage", "Reviewer", "Unit", "Workflow", "Attempt Generation"]
+      .map((f) => field(e, f))
+      .join("\0");
+    const scope = `${key}\0${iteration}`;
+    if (e.event === "REVIEW_REQUESTED") {
+      // A row the engine cannot bind is not a request: `reviewRequestBindingFromBlock`
+      // returns null and `reviewAttemptAccounting` skips it, so it must not take over the
+      // pass of the valid request before it. Transcribed: the fingerprint and Request Id
+      // shapes; not transcribed: the appendix, source-fingerprint and Recovery Cause checks.
+      if (!bindableReviewRequest(e)) return;
+      reviews.set(scope, i);
+      return;
+    }
+    const from = reviews.get(scope);
+    if (from === undefined) return;
+    const request = events[from]!;
+    const requestId = request.fields["Request Id"];
+    const sameRequest =
+      requestId === undefined
+        ? e.fields["Request Id"] === undefined
+        : e.fields["Request Id"] === requestId;
+    const fingerprint = e.fields["Request Fingerprint"] ?? e.fields["Artifact Fingerprint"];
+    if (!sameRequest || fingerprint === undefined) return;
+    if (fingerprint !== request.fields["Artifact Fingerprint"]) return;
+    pairs.push({ request: from, completion: i });
+    reviews.delete(scope);
+  });
+  return { pairs, pending: [...reviews.values()].sort((a, b) => a - b) };
+}
+
+function delegationGaps(events: readonly AuditEvent[]): Set<number> {
+  const marked = new Set<number>();
+  const mark = (from: number, to: number): void => {
+    for (let g = from; g < to; g++) marked.add(g);
+  };
+  const field = (e: AuditEvent, name: string): string => e.fields[name] ?? "";
+  for (const p of pairReviews(events).pairs) mark(p.request, p.completion);
+  const merges = new Map<string, number[]>(); // slug [+ pin identity] → open invocations
+  events.forEach((e, i) => {
+    if (e.event !== "MERGE_DISPATCH_INVOKED" && !MERGE_DISPATCH_END.has(e.event)) return;
+    const slug = field(e, "Bolt slug");
+    if (!slug) return;
+    const pin = ["Pinned OID", "Attempt Generation", "Pin Transaction"].map((f) => field(e, f));
+    const pinned = pin.every((v) => v !== "");
+    const key = pinned ? `${slug}\0${pin.join("\0")}` : slug;
+    const open = merges.get(key) ?? [];
+    if (e.event === "MERGE_DISPATCH_INVOKED") {
+      // A pinned merge reads the terminal after its LAST invocation, so a re-invocation
+      // replaces the open one; an unpinned one queues, as the doctor pairs them.
+      merges.set(key, pinned ? [i] : [...open, i]);
+      return;
+    }
+    const from = open.shift();
+    if (from !== undefined) mark(from, i);
+  });
+  return marked;
+}
+
+/**
+ * Classify the gaps between consecutive events. Exported for tests: the whole
+ * IDLE/AGENT/WORK rule is here and checkable from a synthetic event list.
+ *
+ * `onGap`, when given, is told the bucket of every gap it counts — the one place the
+ * time bins read from, so they cannot drift from this rule.
+ */
+export function classifyGaps(
+  events: AuditEvent[],
+  onGap?: (from: string, to: string, bucket: GapBucket) => void,
+): GapSplit {
+  let humanWaitSec = 0;
+  let parkedSec = 0;
+  let inferredParkSec = 0;
+  let observedSec = 0;
+  let conversationSec = 0;
+  let unknownSec = 0;
+  let unknownToTurnSec = 0;
+  let delegatedSec = 0;
+  let parkAnomalies = 0;
+  const parkedShards = new Set<string>();
+  const unknown: SuspectSpan[] = [];
+
+  // WHICH SHARDS ARE PRESENT AT A GIVEN GAP. A shard's own window spans the gap
+  // when it has already written an event and has not yet written its last. A shard
+  // that has not started, or has already gone quiet, is ABSENT — not working.
+  //
+  // Treating absent as working is what broke the park rule. Comparing against the
+  // whole ledger's shard set made "every clone is parked" unreachable on a
+  // sequential handover: measured on a real 3-shard run whose windows do not
+  // overlap at all, the all-parked branch fired for 0 gaps and claimed 0.00h, so
+  // the 80.31h the ledger explicitly marks as parked was discarded and the panel
+  // instead showed 67.05h inferred from 20 session markers. With presence, the
+  // explicit park is counted and a genuinely parallel run still needs every
+  // present clone parked before the team counts as stopped.
+  const firstIdx = new Map<string, number>();
+  const lastIdx = new Map<string, number>();
+  events.forEach((event, i) => {
+    if (!firstIdx.has(event.shard)) firstIdx.set(event.shard, i);
+    lastIdx.set(event.shard, i);
+  });
+  const presentAt = (i: number): string[] => {
+    const out: string[] = [];
+    for (const [shard, first] of firstIdx) {
+      if (first <= i && (lastIdx.get(shard) ?? -1) >= i + 1) out.push(shard);
+    }
+    return out;
+  };
+
+  const delegatedGaps = delegationGaps(events);
+  const waiting = askWaits(events);
+
+  for (let i = 0; i < events.length - 1; i++) {
+    const a = events[i]!;
+    const b = events[i + 1]!;
+    // The park state moves on every row, including one followed by a row in the same
+    // second: noting it after the zero-gap skip lost a park recorded beside another row,
+    // and the hours after it read as unclassified.
+    if (a.event === "WORKFLOW_PARKED") {
+      if (parkedShards.has(a.shard)) parkAnomalies++;
+      parkedShards.add(a.shard);
+    } else if (a.event === "WORKFLOW_UNPARKED") {
+      if (!parkedShards.has(a.shard)) parkAnomalies++;
+      parkedShards.delete(a.shard);
+    }
+
+    const gap = secs(a.ts, b.ts);
+    if (!Number.isFinite(gap) || gap <= 0) continue;
+
+    // One parked clone does not mean the team stopped — but every PRESENT clone
+    // being parked does.
+    const present = presentAt(i);
+    const parkedPresent = present.filter((shard) => parkedShards.has(shard));
+    let bucket: GapBucket;
+    if (present.length > 0 && parkedPresent.length === present.length) {
+      parkedSec += gap;
+      bucket = "parked";
+    } else if (
+      waiting[i] !== undefined &&
+      present.every((shard) => waiting[i]?.has(shard) || parkedShards.has(shard)) &&
+      // The ask and its answer side by side read as before, ahead of delegation. A wait
+      // spanning other clones' rows does not overwrite a matched delegation window
+      // among them — that window is measured work (found in review, reproduced).
+      ((a.shard === b.shard && waiting[i]?.has(a.shard)) || !delegatedGaps.has(i))
+    ) {
+      humanWaitSec += gap;
+      bucket = "humanWait";
+    } else if (SESSION_RESUME.has(b.event) && gap >= IDLE_FLOOR_SEC) {
+      // Old ledgers do not always carry balanced park markers. Keep this
+      // conservative fallback visible as inferred pause time.
+      parkedSec += gap;
+      inferredParkSec += gap;
+      bucket = "parked";
+    } else if (delegatedGaps.has(i)) {
+      delegatedSec += gap;
+      observedSec += gap;
+      bucket = "observed";
+    } else if (a.event === "HUMAN_TURN" && b.event === "HUMAN_TURN" && a.shard === b.shard) {
+      // A chat exchange. Same shard is load-bearing: two clones' human turns next to
+      // each other in the merged ledger are two developers, not one conversation.
+      // No duration floor either — the classification reads the marker, not the clock,
+      // so a 3-second exchange is the same phenomenon as a 40-minute one.
+      conversationSec += gap;
+      bucket = "conversation";
+    } else if (gap >= SUSPECT_SEC) {
+      unknownSec += gap;
+      if (b.event === "HUMAN_TURN") unknownToTurnSec += gap;
+      unknown.push({ seconds: gap, fromEvent: a.event, toEvent: b.event, at: a.ts });
+      bucket = "unknown";
+    } else {
+      observedSec += gap;
+      bucket = "observed";
+    }
+    onGap?.(a.ts, b.ts, bucket);
+  }
+
+  const idleSec = humanWaitSec + parkedSec;
+  const workSec = observedSec + unknownSec;
+  return {
+    humanWaitSec,
+    parkedSec,
+    inferredParkSec,
+    observedSec,
+    conversationSec,
+    unknownSec,
+    unknownToTurnSec,
+    delegatedSec,
+    parkAnomalies,
+    unknown,
+    idleSec,
+    agentSec: delegatedSec,
+    workSec,
+    suspect: unknown,
+  };
+}
+
+function emptyWorkload(): Workload {
+  return { artifacts: 0, sensors: 0, sensorFailures: 0, delegations: 0, humanTurns: 0 };
+}
+
+/**
+ * Strip the host and clone-id suffix off a shard filename to get something
+ * readable. Shards are named `<host-slug>-<clone12hex>.md`, and the host slug
+ * itself usually carries the developer's name (`jane-doe-c02ab1cd2ef3`), so
+ * dropping the trailing two dash-separated tokens leaves the useful part.
+ * A name that does not match keeps its basename.
+ */
+export function shardLabel(shard: string): string {
+  const base = shard.endsWith(".md") ? shard.slice(0, -3) : shard;
+  // Trailing 12-hex clone id.
+  const noClone = base.replace(/-[0-9a-f]{12}$/i, "");
+  // Trailing host token, only when it looks like a machine id rather than a name
+  // (mixed letters+digits, e.g. "c02ab1cd2ef3"), so "macbook-pro-8-local" stays.
+  return noClone.replace(/-(?=[a-z]*\d)[a-z0-9]{8,}$/i, "");
+}
+
+/** Rank map entries by count, descending, returning the keys. */
+function topKeys(counts: Map<string, number>, limit: number): string[] {
+  return [...counts]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([k]) => k);
+}
+
+/**
+ * Classify each shard's events on their OWN timeline. This is the correct way to
+ * measure waiting on a parallel run — see WorkerSpan for the measured evidence
+ * that the merged view loses most of it.
+ */
+export function buildWorkers(events: AuditEvent[]): WorkerSpan[] {
+  const byShard = new Map<string, AuditEvent[]>();
+  for (const e of events) {
+    const list = byShard.get(e.shard);
+    if (list) list.push(e);
+    else byShard.set(e.shard, [e]);
+  }
+
+  const out: WorkerSpan[] = [];
+  for (const [shard, evs] of byShard) {
+    // `events` arrives time-ordered, so each shard's slice is too.
+    const split = classifyGaps(evs);
+    const stages = new Map<string, number>();
+    const units = new Map<string, number>();
+    let gatesApproved = 0;
+    let stagesCompleted = 0;
+    let endedParked = false;
+    for (const e of evs) {
+      if (e.stage) stages.set(e.stage, (stages.get(e.stage) ?? 0) + 1);
+      if (e.unit) units.set(e.unit, (units.get(e.unit) ?? 0) + 1);
+      if (e.event === "GATE_APPROVED") gatesApproved++;
+      else if (e.event === "STAGE_COMPLETED") stagesCompleted++;
+      else if (e.event === "WORKFLOW_PARKED") endedParked = true;
+      else if (e.event === "WORKFLOW_UNPARKED") endedParked = false;
+    }
+    const firstTs = evs[0]!.ts;
+    const lastTs = evs[evs.length - 1]!.ts;
+    out.push({
+      shard,
+      label: shardLabel(shard),
+      cloneId: /-([0-9a-f]{12})\.md$/.exec(shard)?.[1],
+      endedParked,
+      events: evs.length,
+      firstTs,
+      lastTs,
+      elapsedSec: secs(firstTs, lastTs),
+      humanWaitSec: split.humanWaitSec,
+      parkedSec: split.parkedSec,
+      observedSec: split.observedSec,
+      conversationSec: split.conversationSec,
+      unknownSec: split.unknownSec,
+      unknownToTurnSec: split.unknownToTurnSec,
+      delegatedSec: split.delegatedSec,
+      idleSec: split.idleSec,
+      agentSec: split.agentSec,
+      workSec: split.workSec,
+      gatesApproved,
+      stagesCompleted,
+      stages: topKeys(stages, 4),
+      units: topKeys(units, 12),
+    });
+  }
+
+  return out.sort((a, b) => b.events - a.events);
+}
+
+/** Sum a GapSplit field over segments. */
+function sumSplit(segments: readonly GapSplit[]): GapSplit {
+  const sum = (pick: (g: GapSplit) => number): number => segments.reduce((n, g) => n + pick(g), 0);
+  const humanWaitSec = sum((g) => g.humanWaitSec);
+  const parkedSec = sum((g) => g.parkedSec);
+  const observedSec = sum((g) => g.observedSec);
+  const unknownSec = sum((g) => g.unknownSec);
+  const delegatedSec = sum((g) => g.delegatedSec);
+  const unknown = segments.flatMap((g) => g.unknown);
+  return {
+    humanWaitSec,
+    parkedSec,
+    inferredParkSec: sum((g) => g.inferredParkSec),
+    observedSec,
+    conversationSec: sum((g) => g.conversationSec),
+    unknownSec,
+    unknownToTurnSec: sum((g) => g.unknownToTurnSec),
+    delegatedSec,
+    parkAnomalies: sum((g) => g.parkAnomalies),
+    unknown,
+    idleSec: humanWaitSec + parkedSec,
+    agentSec: delegatedSec,
+    workSec: observedSec + unknownSec,
+    suspect: unknown,
+  };
+}
+
+/**
+ * The unit view — see `UnitSpan`. `events` is the analysed window, time-ordered;
+ * `lastTs` is its last event, where a still-open segment ends.
+ */
+/** The timestamp inside a `Run floor` token (`EVENT:<ts>#n`, `AMBIGUOUS:<ts>#digest`). */
+function floorTs(floor: string | undefined): string | undefined {
+  return floor ? /:(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)#/.exec(floor)?.[1] : undefined;
+}
+
+const UNIT_LIFECYCLE = new Set([
+  "UNIT_STARTED",
+  "UNIT_PAUSED",
+  "UNIT_RESUMED",
+  "UNIT_COMPLETED",
+  "UNIT_SKIPPED",
+]);
+
+/**
+ * The lifecycle rows of the shards that lose the engine's same-second reduction
+ * (`currentUnitLifecycleRows`, aidlc-lib.ts): within one second, per unit, it keeps each
+ * shard's last row and then the highest-ranked of those — PAUSED over STARTED/RESUMED over
+ * COMPLETED/SKIPPED, ties to the later shard — because rows from different clones in one
+ * second are causally unordered and "a possible pause blocks all progress". Only groups
+ * spanning more than one shard are reduced here, and the winning shard keeps its earlier
+ * rows in that second: one shard's rows are in append order, which is causal, and the view
+ * reads them literally (a start receipt written in the second its work closed is still a
+ * segment); the state they leave is the winner's either way. The key carries the `Run
+ * floor` because the engine reduces only the current attempt's rows. `events` is in the
+ * ledger's order — time, then shard index, then position — so iteration order breaks the
+ * rank ties. The engine runs this in every ownership mode; under team ownership it first
+ * filters the rows by claim attempt (`eventMatchesClaimAttempt`). The receipt matrix applies
+ * that filter (scan/claim-attempt.ts); this view does not, because a stale claim attempt's
+ * rows are still time someone spent — so a tie between two claim attempts under one floor
+ * can end differently here from the engine's verdict, which the matrix states.
+ */
+function crossShardTieLosers(events: readonly AuditEvent[]): Set<AuditEvent> {
+  const groups = new Map<string, AuditEvent[]>();
+  for (const e of events) {
+    const stage = e.fields.Stage;
+    const unit = e.fields.Unit;
+    if (!UNIT_LIFECYCLE.has(e.event) || !stage || !unit) continue;
+    const key = `${e.ts}\0${stage}\0${unit}\0${e.fields["Run floor"] ?? ""}`;
+    const list = groups.get(key) ?? [];
+    list.push(e);
+    groups.set(key, list);
+  }
+  const rank = (event: string): number =>
+    event === "UNIT_PAUSED" ? 2 : event === "UNIT_COMPLETED" || event === "UNIT_SKIPPED" ? 0 : 1;
+  const losers = new Set<AuditEvent>();
+  for (const list of groups.values()) {
+    const lastByShard = new Map<string, AuditEvent>();
+    for (const e of list) lastByShard.set(e.shard, e);
+    if (lastByShard.size < 2) continue;
+    // Highest rank wins; among equals the later one, as the engine's ascending sort + last.
+    let winner: AuditEvent | undefined;
+    for (const e of lastByShard.values()) {
+      if (!winner || rank(e.event) >= rank(winner.event)) winner = e;
+    }
+    // The winner's own earlier rows stay: within its shard they are causal, and the view
+    // reads them as the engine never needs to (a start and its pause in one second).
+    for (const e of list) if (e.shard !== winner?.shard) losers.add(e);
+  }
+  return losers;
+}
+
+/**
+ * `events` with each pair's lifecycle rows inside one second put in attempt order — older
+ * `Run floor` first, stable otherwise — in the slots those rows already held. Two clones'
+ * rows in one second are unordered by the merge, and an earlier attempt's row there (a clone
+ * that had not seen the reopen) was written for the attempt it names, so it goes before the
+ * later attempt's rows rather than after them, where the stale-floor guard would drop it.
+ */
+function attemptOrdered(events: readonly AuditEvent[]): AuditEvent[] {
+  const out = [...events];
+  for (let a = 0; a < out.length; ) {
+    let b = a + 1;
+    while (b < out.length && out[b]!.ts === out[a]!.ts) b++;
+    const slots = new Map<string, number[]>();
+    for (let i = a; i < b; i++) {
+      const e = out[i]!;
+      if (!UNIT_LIFECYCLE.has(e.event) || !e.fields.Stage || !e.fields.Unit) continue;
+      const key = `${e.fields.Stage}\0${e.fields.Unit}`;
+      slots.set(key, [...(slots.get(key) ?? []), i]);
+    }
+    for (const idx of slots.values()) {
+      if (idx.length < 2) continue;
+      const at = (e: AuditEvent) => floorTs(e.fields["Run floor"]) ?? "";
+      const rows = idx.map((i) => out[i]!);
+      const sorted = [...rows].sort((x, y) => (at(x) < at(y) ? -1 : at(x) > at(y) ? 1 : 0));
+      idx.forEach((i, k) => {
+        out[i] = sorted[k]!;
+      });
+    }
+    a = b;
+  }
+  return out;
+}
+
+/**
+ * `events` keep their raw shards: the same-second lifecycle reduction is per FILE, as the
+ * engine's `currentUnitLifecycleRows` is. `cloned` (same indices, the shard read as its
+ * clone — `cloneKeys`) is what the segment's gaps and the clone's earlier writes are read
+ * on: a conflict copy's answer to a gate is the same developer's, so a segment started in
+ * the original keeps it. Without `cloned` both read the raw shards.
+ */
+export function buildUnitSpans(
+  events: readonly AuditEvent[],
+  lastTs: string,
+  cloned: readonly AuditEvent[] = events,
+): UnitSpan[] {
+  interface Open {
+    startedAt: string;
+    shard: string;
+    floor?: string;
+    startInferred?: boolean;
+    receiptStartedAt?: string;
+  }
+  interface Raw extends Open {
+    endedAt: string;
+    endKind: StageEndKind;
+    durationUnknown?: boolean;
+    pauseOnly?: boolean;
+  }
+  const cloneOfShard = new Map<string, string>();
+  events.forEach((e, i) => cloneOfShard.set(e.shard, cloned[i]?.shard ?? e.shard));
+  const clone = (shard: string): string => cloneOfShard.get(shard) ?? shard;
+  const open = new Map<string, Open>();
+  const raw = new Map<string, Raw[]>();
+  const order: { key: string; stage: string; unit: string }[] = [];
+  // pair → clone → time of the pair's first record write since its last lifecycle row.
+  const firstWrite = new Map<string, Map<string, string>>();
+  const keyOf = (stage: string, unit: string): string => `${stage}\0${unit}`;
+  /** The pair's first write in `shard`, if it is earlier than `ts` and inside the floor. */
+  const earlierWrite = (key: string, shard: string, ts: string, floor?: string) => {
+    const lower = floorTs(floor);
+    const at = firstWrite.get(key)?.get(shard);
+    return at !== undefined && lower !== undefined && at >= lower && at < ts ? at : undefined;
+  };
+  const close = (key: string, endedAt: string, endKind: StageEndKind): void => {
+    const current = open.get(key);
+    if (!current) return;
+    raw.get(key)!.push({ ...current, endedAt, endKind });
+    open.delete(key);
+  };
+
+  const tied = crossShardTieLosers(events);
+  // pair → the newest `Run floor` time seen on its lifecycle rows.
+  const newestFloor = new Map<string, string>();
+  for (const e of attemptOrdered(events)) {
+    if (tied.has(e)) continue;
+    if (!e.event.startsWith("UNIT_")) {
+      if (e.event !== "ARTIFACT_CREATED" && e.event !== "ARTIFACT_UPDATED") continue;
+      const stage = e.fields.Stage || e.stage;
+      const unit = e.fields.Unit || e.unit;
+      if (!stage || !unit) continue;
+      const key = keyOf(stage, unit);
+      if (open.has(key)) continue;
+      const byShard = firstWrite.get(key) ?? new Map<string, string>();
+      if (!byShard.has(clone(e.shard))) byShard.set(clone(e.shard), e.ts);
+      firstWrite.set(key, byShard);
+      continue;
+    }
+    const stage = e.fields.Stage;
+    const unit = e.fields.Unit;
+    if (!stage || !unit) continue;
+    const key = keyOf(stage, unit);
+    if (!raw.has(key)) {
+      raw.set(key, []);
+      order.push({ key, stage, unit });
+    }
+    const floor = e.fields["Run floor"];
+    // A row stamped with an earlier attempt's floor than one already seen is that attempt's
+    // — a clone that had not seen the reopen yet. The engine reads only the current floor's
+    // rows, so it must not close, supersede or reopen the later attempt. A floor names its
+    // boundary's time, so "earlier" is a time comparison; `unstarted#0` is the earliest. A
+    // row with no floor at all predates the field and is read as before.
+    if (floor !== undefined && UNIT_LIFECYCLE.has(e.event)) {
+      const at = floorTs(floor) ?? "";
+      const newest = newestFloor.get(key);
+      if (newest !== undefined && at < newest) continue;
+      newestFloor.set(key, at);
+    }
+    const current = open.get(key);
+    if (e.event === "UNIT_STARTED") {
+      if (current && current.floor === floor) continue; // a repeated start in one attempt
+      close(key, e.ts, "superseded");
+      const earlier = earlierWrite(key, clone(e.shard), e.ts, floor);
+      open.set(
+        key,
+        earlier !== undefined
+          ? {
+              startedAt: earlier,
+              shard: e.shard,
+              floor,
+              startInferred: true,
+              receiptStartedAt: e.ts,
+            }
+          : { startedAt: e.ts, shard: e.shard, floor },
+      );
+    } else if (e.event === "UNIT_RESUMED") {
+      if (!current) open.set(key, { startedAt: e.ts, shard: e.shard, floor });
+    } else if (e.event === "UNIT_PAUSED") {
+      if (current) close(key, e.ts, "paused");
+      else if (raw.get(key)!.at(-1)?.endKind !== "paused") {
+        // Nothing open — its start was another clone's row in this second and lost the tie,
+        // or never written. The engine reads the unit as paused, so it stays visible: a tick.
+        raw.get(key)!.push({
+          startedAt: e.ts,
+          endedAt: e.ts,
+          endKind: "paused",
+          shard: e.shard,
+          pauseOnly: true,
+        });
+      }
+    } else if (e.event === "UNIT_COMPLETED") {
+      if (current) close(key, e.ts, "completed");
+      else {
+        // A completion with no start receipt: a wave or a recovery completion.
+        const earlier = earlierWrite(key, clone(e.shard), e.ts, floor);
+        raw.get(key)!.push(
+          earlier !== undefined
+            ? {
+                startedAt: earlier,
+                endedAt: e.ts,
+                endKind: "completed",
+                shard: e.shard,
+                startInferred: true,
+              }
+            : {
+                startedAt: e.ts,
+                endedAt: e.ts,
+                endKind: "completed",
+                shard: e.shard,
+                durationUnknown: true,
+              },
+        );
+      }
+    } else if (e.event === "UNIT_SKIPPED") {
+      if (current) close(key, e.ts, "skipped");
+      else
+        raw.get(key)!.push({ startedAt: e.ts, endedAt: e.ts, endKind: "skipped", shard: e.shard });
+    }
+    firstWrite.delete(key);
+  }
+  for (const key of open.keys()) close(key, lastTs, "in-flight");
+
+  const out: UnitSpan[] = [];
+  for (const { key, stage, unit } of order) {
+    const list = raw.get(key)!;
+    if (list.length === 0) continue;
+    const segments: UnitSegment[] = list.map((g) => {
+      const elapsedSec = secs(g.startedAt, g.endedAt);
+      const split = classifyGaps(
+        cloned.filter(
+          (e) => e.shard === clone(g.shard) && e.ts >= g.startedAt && e.ts <= g.endedAt,
+        ),
+      );
+      // What this clone's events do not span is unclassified, so the row adds up.
+      const covered =
+        split.humanWaitSec +
+        split.parkedSec +
+        split.observedSec +
+        split.conversationSec +
+        split.unknownSec;
+      if (elapsedSec > covered) {
+        split.unknownSec += elapsedSec - covered;
+        split.workSec = split.observedSec + split.unknownSec;
+      }
+      return {
+        startedAt: g.startedAt,
+        endedAt: g.endedAt,
+        endKind: g.endKind,
+        ...(g.startInferred ? { startInferred: true } : {}),
+        ...(g.receiptStartedAt ? { receiptStartedAt: g.receiptStartedAt } : {}),
+        ...(g.durationUnknown ? { durationUnknown: true } : {}),
+        ...(g.pauseOnly ? { pauseOnly: true } : {}),
+        elapsedSec,
+        ...split,
+      };
+    });
+    out.push({
+      stage,
+      unit,
+      startedAt: segments[0]!.startedAt,
+      endedAt: segments[segments.length - 1]!.endedAt,
+      endKind: segments[segments.length - 1]!.endKind,
+      elapsedSec: segments.reduce((n, g) => n + g.elapsedSec, 0),
+      segments,
+      ...sumSplit(segments),
+    });
+  }
+  return out.sort((a, b) => (a.startedAt < b.startedAt ? -1 : a.startedAt > b.startedAt ? 1 : 0));
+}
+
+/** The local 00/06/12/18 boundary at or before `ms`. */
+function binFloor(ms: number): number {
+  const d = new Date(ms);
+  d.setHours(d.getHours() - (d.getHours() % (BIN_SEC / 3600)), 0, 0, 0);
+  return d.getTime();
+}
+
+const BUCKET_FIELD: Record<GapBucket, keyof Omit<TimeBin, "start">> = {
+  humanWait: "humanWaitSec",
+  parked: "parkedSec",
+  observed: "observedSec",
+  conversation: "conversationSec",
+  unknown: "unknownSec",
+};
+
+/**
+ * Lay classified gaps onto `BIN_SEC` bins covering `firstTs`…`endTs`. A gap crossing a
+ * bin edge is split by overlap — never assigned whole to the bin it starts in, which
+ * would pile a 30-hour park into one bar.
+ */
+export function buildBins(
+  gaps: { from: string; to: string; bucket: GapBucket }[],
+  firstTs: string,
+  endTs: string,
+): TimeBin[] {
+  const start = binFloor(Date.parse(firstTs));
+  const end = Date.parse(endTs);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return [];
+  const width = BIN_SEC * 1000;
+  const bins: TimeBin[] = [];
+  // Fixed-width steps from a local boundary: a DST change shifts later labels by an
+  // hour instead of producing a 5h or 7h bin, which would skew the bars it holds.
+  for (let at = start; at < end || bins.length === 0; at += width) {
+    bins.push({
+      start: new Date(at).toISOString(),
+      humanWaitSec: 0,
+      parkedSec: 0,
+      observedSec: 0,
+      conversationSec: 0,
+      unknownSec: 0,
+    });
+  }
+  for (const g of gaps) {
+    const from = Date.parse(g.from);
+    const to = Date.parse(g.to);
+    const field = BUCKET_FIELD[g.bucket];
+    const first = Math.max(0, Math.floor((from - start) / width));
+    for (let k = first; k < bins.length; k++) {
+      const lo = Math.max(from, start + k * width);
+      const hi = Math.min(to, start + (k + 1) * width);
+      if (hi <= lo) break;
+      (bins[k] as TimeBin)[field] += (hi - lo) / 1000;
+    }
+  }
+  return bins;
+}
+
+/**
+ * Derive per-stage spans and the whole-run split from the ledger.
+ *
+ * A stage's start is its FIRST STAGE_STARTED (a backward jump re-enters a stage;
+ * keeping the first start means the span covers the rework rather than hiding
+ * it). Its end is the LAST COMPLETED, else the last AWAITING_APPROVAL, else the
+ * ledger's final event for a stage still running.
+ */
+export function buildTiming(ledger: AuditLedger, nowTs?: string): TimingReport {
+  if (ledger.events.length === 0) {
+    return {
+      stages: [],
+      units: [],
+      total: classifyGaps([]),
+      sinceLastEventSec: 0,
+      elapsedSec: 0,
+      bins: [],
+      workers: [],
+      asks: [],
+      parallel: false,
+      clones: 0,
+      overlapSec: 0,
+      handoverSec: 0,
+      personIdleSec: 0,
+      personWorkSec: 0,
+      personHumanWaitSec: 0,
+      personParkedSec: 0,
+      personObservedSec: 0,
+      personConversationSec: 0,
+      personUnknownSec: 0,
+      personElapsedSec: 0,
+    };
+  }
+
+  // The gap readers ask "which clone", so a conflict copy and a claimed unit's local
+  // record read as the clone they belong to (`cloneKeys`). Keyed by the raw file name, the
+  // copy's rows read as another developer's, and its continuation of an ask was lost.
+  // The unit view reduces same-second lifecycle rows per FILE, as the engine does
+  // (`crossShardTieLosers`, one candidate per file before the rank), so it gets the raw
+  // shards too (`actualRaw`, same indices as `actual`) — and classifies a segment's gaps on
+  // the clone, like every other gap reader.
+  const keys = cloneKeys(ledger);
+  const all = ledger.events.some((e) => cloneOf(keys, e.shard) !== e.shard)
+    ? ledger.events.map((e) => ({ ...e, shard: cloneOf(keys, e.shard) }))
+    : ledger.events;
+  const startIndex = all.findIndex((e) => e.event === "WORKFLOW_STARTED");
+  const from = startIndex >= 0 ? startIndex : 0;
+  const completedIndex = all.findLastIndex((e, i) => i >= from && e.event === "WORKFLOW_COMPLETED");
+  const actual = all.slice(from, completedIndex >= 0 ? completedIndex + 1 : undefined);
+  const actualRaw = ledger.events.slice(from, completedIndex >= 0 ? completedIndex + 1 : undefined);
+  const firstTs = actual[0]!.ts;
+  const lastActualTs = actual[actual.length - 1]!.ts;
+  const requestedEnd = completedIndex >= 0 ? lastActualTs : (nowTs ?? lastActualTs);
+  // The WINDOW may end at the read clock, but nothing is CLASSIFIED past the last
+  // event. A synthetic `ANALYSIS_NOW` event used to be appended here and handed to
+  // `classifyGaps`, which charged the silence since the last event to a bucket at
+  // one second per second — measured, `unknownSec` grew from 41.15h to 473.15h over
+  // 18 days of not reading, and the synthetic event name leaked into the on-screen
+  // suspect list as `HUMAN_TURN → ANALYSIS_NOW`. Every classification below now runs
+  // on `actual`, and the trailing silence is reported once, as `sinceLastEventSec`.
+  const endTs = Date.parse(requestedEnd) >= Date.parse(lastActualTs) ? requestedEnd : lastActualTs;
+
+  interface OpenStage {
+    startedAt: string;
+    awaiting: boolean;
+  }
+  interface RawSegment {
+    startedAt: string;
+    endedAt: string;
+    endKind: StageEndKind;
+  }
+
+  const open = new Map<string, OpenStage>();
+  const raw = new Map<string, RawSegment[]>();
+  const finalKind = new Map<string, StageEndKind>();
+  const order: string[] = [];
+
+  const close = (stage: string, endedAt: string, endKind: StageEndKind): void => {
+    const current = open.get(stage);
+    if (!current) return;
+    const list = raw.get(stage) ?? [];
+    list.push({ startedAt: current.startedAt, endedAt, endKind });
+    raw.set(stage, list);
+    open.delete(stage);
+    finalKind.set(stage, endKind);
+  };
+
+  for (const e of actual) {
+    const stage = e.stage;
+    if (!stage) continue;
+    if (!order.includes(stage)) order.push(stage);
+
+    if (e.event === "STAGE_STARTED") {
+      // A repeated start is a real re-entry. Close the still-open entry at the new
+      // boundary rather than stretching one bar across unrelated work — and mark it
+      // superseded, because whatever state it was in, it is over.
+      close(stage, e.ts, "superseded");
+      open.set(stage, { startedAt: e.ts, awaiting: false });
+    } else if (e.event === "STAGE_COMPLETED") {
+      close(stage, e.ts, "completed");
+    } else if (e.event === "STAGE_SKIPPED") {
+      close(stage, e.ts, "skipped");
+    } else if (e.event === "STAGE_AWAITING_APPROVAL") {
+      const current = open.get(stage);
+      if (current) current.awaiting = true;
+    }
+  }
+
+  for (const [stage, current] of open) {
+    // An unfinished stage ends at its last event, NOT at the read clock: otherwise its
+    // bar and elapsed grow every poll while nothing happens (and the growth used to
+    // land in its `unknownSec`, measured 7,620s → 94,020s over 24h of not reading).
+    close(stage, lastActualTs, current.awaiting ? "awaiting-approval" : "in-flight");
+  }
+
+  const stages: StageSpan[] = [];
+
+  for (const stage of order) {
+    const stageSegments = raw.get(stage);
+    if (!stageSegments?.length) continue;
+
+    const segments: StageSegment[] = stageSegments.map((segment) => {
+      const within = actual.filter((e) => e.ts >= segment.startedAt && e.ts <= segment.endedAt);
+      const split = classifyGaps(within);
+      return {
+        ...segment,
+        ...split,
+        elapsedSec: secs(segment.startedAt, segment.endedAt),
+      };
+    });
+    const sum = (pick: (segment: StageSegment) => number): number =>
+      segments.reduce((n, segment) => n + pick(segment), 0);
+
+    const workload = emptyWorkload();
+    for (const e of actual) {
+      if (e.stage !== stage) continue;
+      if (e.event === "ARTIFACT_CREATED" || e.event === "ARTIFACT_UPDATED") workload.artifacts++;
+      else if (e.event === "SENSOR_FIRED") workload.sensors++;
+      else if (e.event === "SENSOR_FAILED") workload.sensorFailures++;
+      else if (e.event === "REVIEW_COMPLETED") workload.delegations++;
+    }
+    for (const segment of stageSegments) {
+      workload.humanTurns += actual.filter(
+        (e) => e.event === "HUMAN_TURN" && e.ts >= segment.startedAt && e.ts <= segment.endedAt,
+      ).length;
+    }
+
+    const humanWaitSec = sum((s) => s.humanWaitSec);
+    const parkedSec = sum((s) => s.parkedSec);
+    const observedSec = sum((s) => s.observedSec);
+    const conversationSec = sum((s) => s.conversationSec);
+    const unknownSec = sum((s) => s.unknownSec);
+    const delegatedSec = sum((s) => s.delegatedSec);
+    const unknown = segments.flatMap((s) => s.unknown);
+    const idleSec = humanWaitSec + parkedSec;
+    const workSec = observedSec + unknownSec;
+
+    stages.push({
+      stage,
+      startedAt: segments[0]!.startedAt,
+      endedAt: segments[segments.length - 1]!.endedAt,
+      endKind: finalKind.get(stage) ?? "in-flight",
+      elapsedSec: sum((s) => s.elapsedSec),
+      segments,
+      humanWaitSec,
+      parkedSec,
+      inferredParkSec: sum((s) => s.inferredParkSec),
+      observedSec,
+      conversationSec,
+      unknownSec,
+      unknownToTurnSec: sum((s) => s.unknownToTurnSec),
+      delegatedSec,
+      parkAnomalies: sum((s) => s.parkAnomalies),
+      unknown,
+      idleSec,
+      agentSec: delegatedSec,
+      workSec,
+      suspect: unknown,
+      workload,
+    });
+  }
+
+  const workers = buildWorkers(actual);
+  const units = buildUnitSpans(actualRaw, lastActualTs, actual);
+  const elapsedSec = secs(firstTs, endTs);
+  const personElapsedSec = workers.reduce((n, w) => n + w.elapsedSec, 0);
+
+  // Did the clones ever work at the same time? Σ pairwise overlap answers it from
+  // the windows alone; the union answers how much of the run any clone covered, and
+  // what is left over is handover.
+  let overlapSec = 0;
+  for (let i = 0; i < workers.length; i++) {
+    for (let j = i + 1; j < workers.length; j++) {
+      const a = workers[i]!;
+      const b = workers[j]!;
+      const from = Math.max(Date.parse(a.firstTs), Date.parse(b.firstTs));
+      const to = Math.min(Date.parse(a.lastTs), Date.parse(b.lastTs));
+      if (to > from) overlapSec += (to - from) / 1000;
+    }
+  }
+  const spans = workers
+    .map((w) => ({ from: Date.parse(w.firstTs), to: Date.parse(w.lastTs) }))
+    .sort((a, b) => a.from - b.from);
+  let coveredSec = 0;
+  let cursor = Number.NEGATIVE_INFINITY;
+  for (const s of spans) {
+    const from = Math.max(s.from, cursor);
+    if (s.to > from) {
+      coveredSec += (s.to - from) / 1000;
+      cursor = s.to;
+    }
+  }
+  const lastEventSpanSec = secs(firstTs, lastActualTs);
+  const handoverSec = Math.max(0, lastEventSpanSec - coveredSec);
+
+  const gaps: { from: string; to: string; bucket: GapBucket }[] = [];
+  const total = classifyGaps(actual, (from, to, bucket) => gaps.push({ from, to, bucket }));
+
+  return {
+    stages,
+    units,
+    total,
+    firstTs,
+    lastTs: endTs,
+    lastEventTs: lastActualTs,
+    sinceLastEventSec: Math.max(0, secs(lastActualTs, endTs)),
+    elapsedSec,
+    bins: buildBins(gaps, firstTs, lastActualTs),
+    workers,
+    asks: askAnswers(actual),
+    parallel: workers.length > 1,
+    clones: new Set(workers.map((w) => w.cloneId ?? w.shard)).size,
+    overlapSec,
+    handoverSec,
+    personIdleSec: workers.reduce((n, w) => n + w.idleSec, 0),
+    personWorkSec: workers.reduce((n, w) => n + w.workSec, 0),
+    personHumanWaitSec: workers.reduce((n, w) => n + w.humanWaitSec, 0),
+    personParkedSec: workers.reduce((n, w) => n + w.parkedSec, 0),
+    personObservedSec: workers.reduce((n, w) => n + w.observedSec, 0),
+    personConversationSec: workers.reduce((n, w) => n + w.conversationSec, 0),
+    personUnknownSec: workers.reduce((n, w) => n + w.unknownSec, 0),
+    personElapsedSec,
+    // Only meaningful when the clones actually overlap — see the field's doc.
+    parallelism: elapsedSec > 0 && overlapSec > 0 ? personElapsedSec / elapsedSec : undefined,
+  };
+}

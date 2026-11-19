@@ -1,0 +1,106 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
+import { describe, expect, test } from "bun:test";
+import { explorerBreadcrumbs, explorerRoots } from "./explorer";
+
+function fakeFilesystem(paths: string[], listings: Record<string, string[]> = {}) {
+  const normalized = new Set(paths.map((value) => value.toLowerCase()));
+  return {
+    directoryExists: (dir: string) => normalized.has(dir.toLowerCase()),
+    listDirectories: (dir: string) => listings[dir] ?? [],
+  };
+}
+
+describe("workspace explorer roots", () => {
+  test("builds macOS home, filesystem, and volume roots without duplicates", () => {
+    const fs = fakeFilesystem(["/home/user", "/", "/Volumes/Team", "/home/user/current"], {
+      "/Volumes": ["Team"],
+    });
+    const roots = explorerRoots("/Volumes/Team/project", {
+      platform: "darwin",
+      homeDir: "/home/user",
+      activeRoot: "/home/user/current",
+      ...fs,
+    });
+
+    expect(roots.map(({ label, path, kind }) => ({ label, path, kind }))).toEqual([
+      // A root's label is a KEY plus the part read off the filesystem — the words live in
+      // render/i18n so the chip can be rendered in either language.
+      { label: { key: "home" }, path: "/home/user", kind: "home" },
+      { label: { key: "current" }, path: "/home/user/current", kind: "current" },
+      { label: { key: "root" }, path: "/", kind: "filesystem" },
+      { label: { key: "volume", name: "Team" }, path: "/Volumes/Team", kind: "volume" },
+    ]);
+    expect(roots.find((root) => root.active)?.path).toBe("/Volumes/Team");
+  });
+
+  test("finds Linux mount and media roots", () => {
+    const fs = fakeFilesystem(
+      ["/home/user", "/", "/mnt/shared", "/media/user", "/media/user/USB"],
+      {
+        "/mnt": ["shared"],
+        "/media": ["user"],
+        "/media/user": ["USB"],
+      },
+    );
+    const roots = explorerRoots("/media/user/USB/repo", {
+      platform: "linux",
+      homeDir: "/home/user",
+      ...fs,
+    });
+
+    expect(roots.map((root) => root.path)).toEqual([
+      "/home/user",
+      "/",
+      "/mnt/shared",
+      "/media/user",
+      "/media/user/USB",
+    ]);
+    expect(roots.find((root) => root.active)?.path).toBe("/media/user/USB");
+  });
+
+  test("probes Windows drives and de-duplicates OneDrive case-insensitively", () => {
+    const fs = fakeFilesystem(["C:\\Users\\me", "C:\\", "D:\\", "C:\\Users\\me\\OneDrive"], {
+      "C:\\Users\\me": ["OneDrive"],
+    });
+    const roots = explorerRoots("D:\\work", {
+      platform: "win32",
+      homeDir: "C:\\Users\\me",
+      env: {
+        USERPROFILE: "C:\\Users\\me",
+        OneDrive: "C:\\Users\\me\\OneDrive",
+        OneDriveCommercial: "c:\\users\\me\\onedrive",
+      },
+      ...fs,
+    });
+
+    expect(roots.map((root) => root.path)).toEqual([
+      "C:\\Users\\me",
+      "C:\\",
+      "D:\\",
+      "C:\\Users\\me\\OneDrive",
+    ]);
+    expect(roots.find((root) => root.active)?.path).toBe("D:\\");
+  });
+});
+
+describe("workspace explorer breadcrumbs", () => {
+  test("builds POSIX root and segment links", () => {
+    expect(explorerBreadcrumbs("/home/user/project", "darwin")).toEqual([
+      { label: "/", path: "/", current: false },
+      { label: "home", path: "/home", current: false },
+      { label: "user", path: "/home/user", current: false },
+      { label: "project", path: "/home/user/project", current: true },
+    ]);
+  });
+
+  test("keeps the Windows drive root intact", () => {
+    expect(explorerBreadcrumbs("C:\\Users\\me\\project", "win32")).toEqual([
+      { label: "C:\\", path: "C:\\", current: false },
+      { label: "Users", path: "C:\\Users", current: false },
+      { label: "me", path: "C:\\Users\\me", current: false },
+      { label: "project", path: "C:\\Users\\me\\project", current: true },
+    ]);
+  });
+});

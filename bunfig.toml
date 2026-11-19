@@ -1,0 +1,7 @@
+# Bun configuration.
+#
+# `[test] root` keeps test discovery inside src/. Without it `bun test` also runs any old copy
+# left in the working tree (such as an untracked `__backup/`), which then joins the gate and
+# breaks it as soon as the copy drifts.
+[test]
+root = "src"

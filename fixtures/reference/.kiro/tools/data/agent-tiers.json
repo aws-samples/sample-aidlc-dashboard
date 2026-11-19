@@ -1,0 +1,7 @@
+{
+  "architect": "judgment",
+  "developer": "judgment",
+  "quality": "judgment",
+  "product-lead": "balanced",
+  "pipeline-deploy": "templated"
+}
