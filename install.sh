@@ -2,19 +2,29 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-# aidlc-dashboard installer — macOS / Linux.
+# aidlc-dashboard installer — macOS / Linux. Run it from a clone:
+#
+#   sh install.sh
+#
+# builds the executable for this machine from the clone (`bun run package --only
+# <platform>`), installs it and starts it. It downloads nothing: the clone is the
+# source, and the build needs no `bun install` (there are no runtime dependencies). A
+# release download path was here until 2026-11-19 and was removed in the security
+# review, because it installed an executable fetched over the network with no checksum
+# check; it comes back only with one.
 #
 #   AIDLC_ARCHIVE=dist/aidlc-dashboard-<version>-<os>-<arch>.zip sh install.sh
 #
-# installs an archive you built yourself with `bun run package` (README, "Build an
-# executable"). It downloads nothing: AIDLC_ARCHIVE is required. A release download path
-# was here until 2026-11-19 and was removed in the security review, because it installed
-# an executable fetched over the network with no checksum check.
+# installs an archive you built yourself instead, and needs no bun.
+#
+# BUN IS A PREREQUISITE, NEVER INSTALLED HERE. The build needs Bun at the floor in
+# `package.json`'s `engines.bun`, and the executable it makes embeds THAT Bun as its
+# runtime — so the floor is checked before the build, with the same comparator the
+# server uses (`src/version.ts`), not a second copy of the number. Without bun, or
+# below the floor, the script says so and stops.
 #
 # WHAT IT INSTALLS. One executable for this machine's platform, built with
 # `bun build --compile` — the Bun runtime is inside it, so nothing else is installed.
-# (Until 1.12 the release was a source zip plus bun, which this script detected,
-# offered to install and checked against a version floor. All of that is gone.)
 #
 # WHY A SEPARATE SCRIPT AND NOT "unzip it". Two things have to happen in order and one
 # of them is destructive if you get it wrong:
@@ -32,9 +42,10 @@
 # POSIX sh on purpose — it may be run by any `sh`, so no arrays, no [[, no `local`.
 #
 # Knobs (env vars):
-#   AIDLC_ARCHIVE=/path/to.zip     the archive to install (required)
+#   AIDLC_ARCHIVE=/path/to.zip     install this archive instead of building one
 #   AIDLC_DIR=~/.aidlc-dashboard   where to install
 #   AIDLC_NO_BIN=1                 do not create the ~/.local/bin launcher
+#   AIDLC_NO_RUN=1                 do not start the dashboard afterwards
 
 set -eu
 
@@ -49,8 +60,6 @@ die() { printf '✗ %s\n' "$*" >&2; exit 1; }
 # ---- prerequisites ----------------------------------------------------------
 # unzip only — `tar` cannot read a zip portably.
 command -v unzip >/dev/null 2>&1 || die "unzip is required."
-[ -n "${AIDLC_ARCHIVE:-}" ] || die "AIDLC_ARCHIVE is required — build an archive with \`bun run package\` and pass it:
-  AIDLC_ARCHIVE=dist/aidlc-dashboard-<version>-<os>-<arch>.zip sh install.sh"
 
 # ---- which platform ---------------------------------------------------------
 # The release names: darwin|linux × arm64|x64 (windows uses install.ps1).
@@ -72,20 +81,50 @@ if [ "$OS" = darwin ] && [ "$ARCH" = x64 ] &&
 fi
 PLATFORM="$OS-$ARCH"
 
-# ---- which archive ----------------------------------------------------------
-[ -f "$AIDLC_ARCHIVE" ] || die "AIDLC_ARCHIVE file not found: $AIDLC_ARCHIVE"
-ASSET=$(basename "$AIDLC_ARCHIVE")
-# The version is read off the archive's own name, so the summary below is true.
-VER=$(printf '%s\n' "$ASSET" | sed -n 's/^aidlc-dashboard-\(.*\)-[a-z]*-[a-z0-9]*\.zip$/\1/p')
-[ -n "$VER" ] || VER="?"
-say "▸ Local archive ($ASSET)"
-
-# ---- unpack -----------------------------------------------------------------
 TMP=$(mktemp -d) || die "Cannot create a temporary directory."
 # Clean up on any exit, including the failure paths below.
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
-cp "$AIDLC_ARCHIVE" "$TMP/$ASSET" || die "Cannot copy the archive: $AIDLC_ARCHIVE"
+# ---- which archive: handed in, or built from this clone ---------------------
+if [ -n "${AIDLC_ARCHIVE:-}" ]; then
+  [ -f "$AIDLC_ARCHIVE" ] || die "AIDLC_ARCHIVE file not found: $AIDLC_ARCHIVE"
+  ARCHIVE="$AIDLC_ARCHIVE"
+  say "▸ Local archive ($(basename "$ARCHIVE"))"
+else
+  # The clone is the directory this script sits in, not the caller's cwd.
+  ROOT=$(cd "$(dirname "$0")" && pwd) || die "Cannot find the directory this script is in."
+  [ -f "$ROOT/package.json" ] && [ -f "$ROOT/scripts/package.ts" ] ||
+    die "Run this from a clone of the repository (no package.json or scripts/package.ts beside it): $ROOT"
+  command -v bun >/dev/null 2>&1 ||
+    die "Bun is required to build the dashboard and was not found on PATH. Install Bun (see bun.sh), open a new terminal and run this again."
+  command -v zip >/dev/null 2>&1 || die "zip is required to build the archive."
+  # Exit 3 and the floor on stdout means "below the floor"; an unreadable version or
+  # floor is not "too old", as the server reads it.
+  FLOOR=$(cd "$ROOT" && bun -e 'import { BUN_FLOOR, belowFloor } from "./src/version.ts";
+if (BUN_FLOOR && belowFloor(Bun.version, BUN_FLOOR)) { console.log(BUN_FLOOR); process.exit(3); }' 2>/dev/null) &&
+    FLOOR_RC=0 || FLOOR_RC=$?
+  if [ "$FLOOR_RC" = 3 ]; then
+    die "Bun $(bun --version 2>/dev/null) is too old — $FLOOR or later is required. Upgrade Bun and run this again."
+  elif [ "$FLOOR_RC" != 0 ]; then
+    die "Cannot run Bun to check its version (bun -e failed in $ROOT)."
+  fi
+  say "▸ Building for $PLATFORM with Bun $(bun --version) (from $ROOT)"
+  # The build log carries the release audit's lines, which are about publishing, not
+  # installing — shown only when the build fails.
+  if ! (cd "$ROOT" && bun run scripts/package.ts "$TMP/dist" --only "$PLATFORM") >"$TMP/build.log" 2>&1; then
+    cat "$TMP/build.log" >&2
+    die "The build failed — the existing install is untouched."
+  fi
+  ARCHIVE=$(ls "$TMP"/dist/aidlc-dashboard-*-"$PLATFORM".zip 2>/dev/null | head -n 1)
+  [ -n "$ARCHIVE" ] || die "The build made no archive for $PLATFORM."
+fi
+ASSET=$(basename "$ARCHIVE")
+# The version is read off the archive's own name, so the summary below is true.
+VER=$(printf '%s\n' "$ASSET" | sed -n 's/^aidlc-dashboard-\(.*\)-[a-z]*-[a-z0-9]*\.zip$/\1/p')
+[ -n "$VER" ] || VER="?"
+
+# ---- unpack -----------------------------------------------------------------
+cp "$ARCHIVE" "$TMP/$ASSET" || die "Cannot copy the archive: $ARCHIVE"
 [ -s "$TMP/$ASSET" ] || die "The archive is empty: $ASSET"
 
 unzip -q "$TMP/$ASSET" -d "$TMP/x" || die "Cannot unzip $ASSET."
@@ -169,3 +208,14 @@ say "  $RUN ~/path/to/workspace"
 say ""
 say "  The browser opens on its own (--no-open turns that off)."
 say "  Read-only — this dashboard never writes to the workspace."
+
+# ---- start ------------------------------------------------------------------
+# By its real path, as the launcher does, so `data/` is found beside it. `exec`, so
+# Ctrl+C stops the dashboard itself — which is why TMP is removed by hand first: an
+# exec'd process never runs this shell's EXIT trap.
+[ "${AIDLC_NO_RUN:-}" = "1" ] && exit 0
+say ""
+say "▸ Starting it now (Ctrl+C stops it; AIDLC_NO_RUN=1 skips this step)"
+rm -rf "$TMP"
+trap - EXIT INT TERM
+exec "$DIR/$EXE_NAME"
