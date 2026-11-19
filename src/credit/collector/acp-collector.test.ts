@@ -14,6 +14,7 @@ import {
   type AcpRpc,
   type AcpSessionRef,
   collectUsageViaAcp,
+  isCliV3Server,
   mapAcpUsage,
   spawnAcpRpc,
 } from "./acp-collector";
@@ -227,6 +228,90 @@ describe("collectUsageViaAcp", () => {
     const r = await collectUsageViaAcp({ rpc: s.rpc });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain("sessionId");
+  });
+});
+
+/**
+ * The CLI V3 server, as captured from `kiro-cli acp --agent-engine=v3` on kiro-cli 3.5.0 (2026-11-19):
+ * `initialize` advertises `_meta.kiro.extensionMethods` (trimmed here), `getUsage` is not among them yet
+ * answers, and `commands/execute` is gone.
+ */
+const V3_SCRIPT = {
+  initialize: {
+    result: {
+      protocolVersion: 1,
+      agentCapabilities: {
+        loadSession: true,
+        _meta: { kiro: { extensionMethods: ["_kiro/session/context", "_kiro/session/compact"] } },
+      },
+    },
+  },
+  "_kiro/account/getUsage": {
+    result: {
+      success: true,
+      message: "Plan: KIRO POWER | 1 usage breakdowns",
+      data: liveData(),
+    },
+  },
+  "_kiro.dev/commands/execute": {
+    error: { code: -32603, message: "Internal error" },
+  },
+};
+
+describe("collectUsageViaAcp on a CLI V3 server", () => {
+  test("calls getUsage with no session — no session/new, so no session files", async () => {
+    const session: AcpSessionRef = {};
+    const s = stubRpc(V3_SCRIPT);
+    const r = await collectUsageViaAcp({ rpc: s.rpc, session });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.data.usedAmount).toBe(7609.69);
+    expect(s.calls.map((c) => c.method)).toEqual(["initialize", "_kiro/account/getUsage"]);
+    expect(s.calls[1]?.params).toEqual({});
+    expect(session.id).toBeUndefined();
+    expect(s.closed()).toBe(1);
+  });
+
+  test("a refused getUsage is a failure naming the V3 method", async () => {
+    const s = stubRpc({
+      ...V3_SCRIPT,
+      "_kiro/account/getUsage": { error: { code: -32601, message: "Method not found" } },
+    });
+    const r = await collectUsageViaAcp({ rpc: s.rpc });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toContain("_kiro/account/getUsage");
+    expect(s.closed()).toBe(1);
+  });
+
+  test("success not true is a failure on V3 too", async () => {
+    const s = stubRpc({
+      ...V3_SCRIPT,
+      "_kiro/account/getUsage": { result: { success: false, message: "not signed in" } },
+    });
+    const r = await collectUsageViaAcp({ rpc: s.rpc });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toContain("did not report success");
+  });
+});
+
+describe("isCliV3Server", () => {
+  test("reads the advertised extension list, not protocolVersion", () => {
+    expect(isCliV3Server(V3_SCRIPT.initialize.result)).toBe(true);
+    // The V2 server's initialize on kiro-cli 3.5.0: same protocolVersion, no `_meta`.
+    expect(
+      isCliV3Server({ protocolVersion: 1, agentCapabilities: { loadSession: true, auth: {} } }),
+    ).toBe(false);
+  });
+
+  test("anything unreadable reads as V2", () => {
+    for (const v of [
+      undefined,
+      null,
+      {},
+      { agentCapabilities: null },
+      { agentCapabilities: { _meta: { kiro: { extensionMethods: "x" } } } },
+    ]) {
+      expect(isCliV3Server(v)).toBe(false);
+    }
   });
 });
 
