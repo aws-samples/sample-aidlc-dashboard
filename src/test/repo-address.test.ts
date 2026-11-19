@@ -5,6 +5,7 @@
 // after a move points readers at a repository that is gone. `scripts/set-repo.ts` rewrites
 // them; this keeps them rewritten. And the installers download nothing (the security
 // review, 2026-11-19): a network fetch with no checksum check is not to come back unnoticed.
+// install.sh builds from the clone instead; install.ps1 still takes a zip it is handed.
 
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
@@ -33,7 +34,11 @@ describe("the installers download nothing", () => {
       expect(text).not.toMatch(
         /\b(?:curl|wget)\s+-|Invoke-WebRequest|Invoke-RestMethod|\birm\s+\S+\s*\|/,
       );
-      expect(text).toContain("AIDLC_ARCHIVE is required");
+      // Where the executable comes from instead: a zip handed in, or (install.sh) one built
+      // from the clone the script sits in.
+      expect(text).toContain(
+        rel === "install.sh" ? "bun run scripts/package.ts" : "AIDLC_ARCHIVE is required",
+      );
     });
   }
 });

@@ -47,7 +47,6 @@
 // surface. The script checks the root for one afterwards and fails if it finds it.
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -255,25 +254,10 @@ fs.rmSync(work, { recursive: true, force: true });
 const stray = fs.readdirSync(ROOT).filter((n) => n.endsWith(".bun-build"));
 if (stray.length > 0) fail(`bun build left scratch files in the repo root: ${stray.join(", ")}`);
 
-// SHA256SUMS lists every archive of THIS version in the output dir, not only the ones
-// built now, so a build split over several `--only` runs still ends with one file that
-// matches the folder. The format is what `shasum -a 256 -c` / `sha256sum -c` read, and a
-// release ships it beside the zips: the installers download nothing, so the person who
-// downloads a zip by hand checks it with that file (README, "Install from a release").
-const sha256 = (file: string) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
-const prefix = `aidlc-dashboard-${version}-`;
-const sums = fs
-  .readdirSync(outDir)
-  .filter((n) => n.startsWith(prefix) && n.endsWith(".zip"))
-  .sort()
-  .map((n) => `${sha256(path.join(outDir, n))}  ${n}\n`);
-fs.writeFileSync(path.join(outDir, "SHA256SUMS"), sums.join(""));
-
 for (const out of written) {
   const mb = (fs.statSync(out).size / 1024 / 1024).toFixed(1);
   console.log(`✓ ${path.basename(out)} · ${mb}MB`);
 }
-console.log(`✓ SHA256SUMS · ${sums.length} archive(s) of v${version}`);
 console.log(`  v${version} · ${written.length} target(s) → ${outDir}`);
 console.log(
   `  leak audit (bundle, README): ${FORBIDDEN.length} path + ${SECRETS.length} content patterns passed${customers.names.length === 0 ? ` ⚠ no customer-name list (${customers.file}) — names not checked` : ""}`,
