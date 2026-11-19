@@ -1,0 +1,2776 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
+// End-to-end tests against the checked-in synthetic workspace under
+// fixtures/reference/. These assert the whole pipeline — resolve → scan →
+// assemble → render — on a tree small enough to reason about by hand.
+//
+// The fixture deliberately encodes the situations that were hard to get right on
+// a real run: a stale runtime-graph, a per-unit segment stopped mid-contract, an
+// unanswered question, two audit shards, and both Context shapes.
+
+import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { UsageError, expandHome, parseArgs } from "../cli";
+import { projectSlug } from "../credit/claude/transcript-reader";
+import { NoRunError, assemble } from "../model/assemble";
+import { dur, esc, hours } from "../render/common";
+import { renderHealth } from "../render/health";
+import { strings } from "../render/i18n";
+import { warningTextIn } from "../render/warnings";
+
+const KO = strings("ko");
+const EN = strings("en");
+import { renderUnresolved } from "../render/cards";
+import { renderDeferrals } from "../render/deferrals";
+import { renderJourney } from "../render/journey";
+import { renderBody, renderPage } from "../render/page";
+import { renderPicker } from "../render/picker";
+import { listStageArtifacts } from "../scan/artifacts";
+import { browse, resolveWorkspace } from "../scan/browse";
+import { openArtifact } from "../scan/open-file";
+import { findHarnessDir } from "../scan/stage-catalog";
+import { readWorkspaceSummary } from "../scan/summary";
+import { MAX_VIEW_BYTES, readArtifactSource } from "../scan/view-file";
+
+/**
+ * The page body plus the deferrals panel. The page no longer mounts that panel
+ * (SHOW_DEFERRALS in render/cards.ts) but still renders it, so its readings are
+ * checked on the panel itself, next to the body's own.
+ */
+const withDeferrals = (m: Parameters<typeof renderBody>[0], locale: "ko" | "en" = "ko") =>
+  renderBody(m, locale) + renderDeferrals(m, strings(locale));
+
+const FIXTURE = path.join(import.meta.dir, "..", "..", "fixtures", "reference");
+/** The fixture's stop-guard signature, in the 2.11 shape: stage, state digest, directive. */
+const FIXTURE_GUARD =
+  "code-generation::439410860bf8adf28c121a3eee7e83135b1209ee1a02d4f71487c39d11ba9ef1::29ced7bcefb33d16ead9fd1bc563c9287d5479431dd947570757e7d30203db4d";
+
+/** Warning CODES, which is what these tests assert on. They used to substring-match the
+ *  Korean sentence, so rewording broke the suite while a wrong code passed silently. */
+const codes = (m: { warnings: { code: string }[] }): string[] => m.warnings.map((w) => w.code);
+
+describe("assemble on the fixture workspace", () => {
+  const m = assemble(FIXTURE);
+
+  test("resolves the active intent through the cursors", () => {
+    expect(m.identity.space).toBe("default");
+    expect(m.identity.record).toBe("260101-demo-migration");
+    expect(m.identity.slug).toBe("demo-migration"); // from intents.json
+    expect(m.identity.status).toBe("in-flight");
+  });
+
+  test("reads state.md progress", () => {
+    expect(m.state.lifecyclePhase).toBe("CONSTRUCTION");
+    expect(m.state.currentStage).toBe("code-generation");
+    expect(m.state.overallDone).toBe(4);
+    expect(m.state.overallTotal).toBe(5);
+    expect(m.state.overallPct).toBe(80);
+    expect(m.state.revisionCount).toBe("2");
+  });
+
+  test("phase roll-up matches the checkbox grid", () => {
+    const byKey = new Map(m.state.phases.map((p) => [p.key, p]));
+    expect(byKey.get("construction")?.done).toBe(1); // functional-design only
+    expect(byKey.get("construction")?.total).toBe(2); // infra-design is SKIP
+    expect(byKey.get("operation")?.skipped).toBe(true);
+  });
+
+  test("merges BOTH audit shards in time order", () => {
+    const shards = new Set(m.recentEvents.map((e) => e.shard));
+    expect(shards.size).toBe(2);
+    expect(m.totalEvents).toBe(37); // 34 in the main shard (3 ERROR_LOGGED) + 3 in the second
+    // The fixture's review is a 2.11 pair (Request Id, Iteration, fingerprint): its five
+    // minutes are delegated, and the subagent row in between does not cut it short.
+    const cg = m.timing.stages.find((t) => t.stage === "code-generation");
+    expect(cg?.delegatedSec).toBe(300);
+    // The second shard's events are later, so they sort last overall.
+    expect(m.recentEvents[0]?.ts).toBe("2026-01-02T09:58:00Z");
+  });
+
+  test("attributes both Context shapes correctly", () => {
+    // Per-unit write: unit in slot 1, stage in slot 2.
+    const perUnit = m.recentEvents.find(
+      (e) => e.unit === "PU-A-core" && e.event === "ARTIFACT_CREATED",
+    );
+    expect(perUnit?.stage).toBe("code-generation");
+    // Ordinary write: stage in slot 1, no unit.
+    const plain = m.recentEvents.find(
+      (e) => e.stage === "intent-capture" && e.event === "ARTIFACT_CREATED",
+    );
+    expect(plain?.unit).toBeUndefined();
+  });
+
+  test("three-state matrix separates started from finished", () => {
+    const cg = m.matrix?.stages.find((s) => s.slug === "code-generation")!;
+    expect(m.matrix?.contractAware).toBe(true);
+    expect(cg.complete).toBe(1); // PU-A-core: plan + summary
+    expect(cg.partial).toBe(1); // PU-B-ui: plan only, summary missing
+    const partial = cg.cells.find((c) => c.state === "partial")!;
+    expect(partial.unit).toBe("PU-B-ui");
+    expect(partial.missing).toEqual(["code-summary"]);
+  });
+
+  test("kind-scoped expectations hold per unit", () => {
+    const fd = m.matrix?.stages.find((s) => s.slug === "functional-design")!;
+    // library gets business-rules, ui gets frontend-components — both complete.
+    expect(fd.complete).toBe(2);
+    expect(fd.partial).toBe(0);
+    // Both cells also contract `traceability`, which the engine writes as
+    // `traceability.json` (`artifactFilename`) — an `.md`-only filter puts both at
+    // "partial".
+    expect(fd.cells.every((c) => c.present.includes("traceability.json"))).toBe(true);
+  });
+
+  test("skipped stage keeps a row with no cells", () => {
+    const infra = m.matrix?.stages.find((s) => s.slug === "infrastructure-design")!;
+    expect(infra.execute).toBe(false);
+    expect(infra.cells).toEqual([]);
+    expect(infra.total).toBe(0);
+  });
+
+  test("bolt batches carry the topological order", () => {
+    expect(m.matrix?.batches).toEqual([["PU-A-core"], ["PU-B-ui"]]);
+  });
+
+  test("finds the unanswered question and marks it current-stage", () => {
+    expect(m.blockers.length).toBe(1);
+    const b = m.blockers[0]!;
+    expect(b.unit).toBe("PU-B-ui");
+    expect(b.stage).toBe("code-generation");
+    expect(b.isCurrentStage).toBe(true);
+    expect(b.heading).toContain("Q1");
+  });
+
+  test("sensor counts come from the audit, bodies from disk", () => {
+    expect(m.sensors.totalFired).toBe(3);
+    expect(m.sensors.totalPassed).toBe(2);
+    expect(m.sensors.totalFailed).toBe(1);
+    expect(m.sensors.orphanDetailFiles).toBe(0);
+    const f = m.sensors.failures[0]!;
+    expect(f.id).toBe("type-check");
+    expect(f.errors.length).toBe(2);
+    expect(f.errors[0]?.message).toContain("not assignable");
+  });
+
+  test("sensor, gate, diary and hook health data stay diagnostic without cards", () => {
+    const html = renderBody(m);
+    expect(html).not.toContain('id="decisions"');
+    expect(html).not.toContain("<h2>Sensor");
+    expect(html).not.toContain('id="sensors"');
+    expect(html).not.toContain("not assignable");
+    expect(html).not.toContain("<h2>승인 게이트</h2>");
+    expect(html).not.toContain("Revision 은 게이트 반려");
+    expect(html).not.toContain("<h2>Hook 헬스</h2>");
+    expect(html).not.toContain('id="health"');
+  });
+
+  test("gate ledger spans both shards", () => {
+    expect(m.gates.approved).toBe(2);
+    expect(m.gates.rejected).toBe(1); // only in the second shard
+    expect(m.gates.revisionCount).toBe(2);
+  });
+
+  test("diary counts every axis", () => {
+    expect(m.diaries.totals.interpretations).toBe(3);
+    expect(m.diaries.totals.deviations).toBe(1);
+    expect(m.diaries.totals.openQuestions).toBe(2);
+    expect(m.diaries.records.length).toBe(6);
+  });
+
+  test("deferral ledger resolves every owner state the fixture encodes", () => {
+    const d = m.deferrals;
+    expect(d.sections).toBe(6);
+    // One artifact declares `None.`, and so do the two that carry a declared ledger.
+    expect(d.emptySections).toBe(3);
+    expect(d.unreadSections).toEqual([]);
+    expect(d.rows).toBe(7);
+    expect(d.items.length).toBe(6); // one item is restated downstream (fan-in)
+    expect(d.counts).toEqual({
+      passed: 2,
+      current: 1,
+      ahead: 0,
+      outOfScope: 1,
+      nextCycle: 1,
+      unassigned: 1,
+    });
+    expect(d.catalogMissing).toBe(false);
+    expect(d.declared.ledgers.map((l) => [l.source, l.status, l.count])).toEqual([
+      ["requirements", "read", 2],
+      ["contract", "read", 1],
+    ]);
+  });
+
+  test("a deferral restated downstream is ONE decision, dated from its first record", () => {
+    const shared = m.deferrals.items.find((i) => i.item === "두 유닛의 공통 타입을 어디에 두는가");
+    // Recorded by units-generation, restated by PU-A-core/functional-design. Counting
+    // mentions would double a single unresolved decision.
+    expect(shared?.sources.length).toBe(2);
+    expect(shared?.rel).toBe("inception/units-generation/unit-of-work-dependency.md");
+    expect(shared?.ownerStage).toBe("functional-design");
+    expect(shared?.ownerStatus).toBe("passed");
+  });
+
+  test("a SKIP-ped owner counts as passed — nobody is going to ask it", () => {
+    const skipped = m.deferrals.items.find((i) => i.ownerStage === "infrastructure-design");
+    expect(skipped?.ownerStatus).toBe("passed");
+  });
+
+  test("prose assumptions stay ownerless even when they name a stage", () => {
+    // One fixture bullet mentions `code-generation` in prose. The table is the
+    // contract; prose is not, so no owner is inferred from it.
+    expect(m.deferrals.assumptions.length).toBe(3);
+    const prose = m.deferrals.assumptions.find((a) => a.text.includes("code-generation"));
+    expect(prose).toBeDefined();
+    expect(m.deferrals.items.some((i) => i.item.includes("배포 대상 환경"))).toBe(false);
+  });
+
+  test("the ledger is invisible to the blocker panel, which is why it needs its own", () => {
+    // The fixture has exactly one blank [Answer]: — so one blocker — while carrying
+    // six unresolved decisions. Neither count implies the other.
+    expect(m.blockers.length).toBe(1);
+    expect(m.deferrals.items.length).toBe(6);
+  });
+
+  test("hook health reads heartbeats, drops and the stop guard", () => {
+    // 7 distinct hooks: 6 with a .last, plus kiro-adapter which only has .drops.
+    // `stop` has both files and must not be counted twice.
+    expect(m.health.hooks.length).toBe(7);
+    const stop = m.health.hooks.find((h) => h.name === "stop")!;
+    expect(stop.drops).toBe(2);
+    expect(stop.topDropReasons[0]?.count).toBe(2);
+    const adapter = m.health.hooks.find((h) => h.name === "kiro-adapter")!;
+    expect(adapter.lastFired).toBeUndefined(); // dropped but never fired
+    expect(adapter.degradedDrops).toBe(1);
+    expect(m.health.stopGuard).toEqual({ signature: FIXTURE_GUARD, count: 1 });
+  });
+
+  test("treats the 2-shard fixture as a handover, not parallel development", () => {
+    // The fixture has a main shard plus a short second-clone shard, and their windows
+    // do not overlap — which is what a real multi-developer run looked like too.
+    expect(m.timing.parallel).toBe(true); // more than one shard, structurally
+    expect(m.timing.workers.length).toBe(2);
+    expect(m.timing.clones).toBe(2);
+    // Person-time is the sum of the shards' own spans, so it differs from the
+    // team wall-clock whenever the shards do not cover the same window.
+    expect(m.timing.personElapsedSec).not.toBe(m.timing.elapsedSec);
+    // No overlap → the concurrency ratio is withheld rather than shown as ~1.
+    expect(m.timing.overlapSec).toBe(0);
+    expect(m.timing.parallelism).toBeUndefined();
+    expect(m.timing.handoverSec).toBeGreaterThan(0);
+    // Only the busier shard drove gates.
+    expect(m.timing.workers[0]?.gatesApproved).toBe(2);
+    expect(m.timing.workers[1]?.gatesApproved).toBe(0);
+  });
+
+  test("merged and per-worker idle measure DIFFERENT things, either can be larger", () => {
+    // Both directions are real, so neither may be asserted as a bound:
+    //  - merged is smaller when clones overlap (another's events fill a wait);
+    //  - merged is LARGER at a handoff (A ends, B starts 45 min later — a team-wide
+    //    pause that belongs to no single shard's timeline).
+    // The fixture is the handoff case, so here merged > per-worker.
+    expect(m.timing.total.idleSec).toBeGreaterThan(m.timing.personIdleSec);
+    // What must always hold: per-worker figures never exceed their own span.
+    for (const w of m.timing.workers) {
+      expect(w.idleSec + w.workSec).toBeLessThanOrEqual(w.elapsedSec + 1);
+    }
+  });
+
+  test("timing spans every entered stage, including the in-flight one", () => {
+    const slugs = m.timing.stages.map((s) => s.stage);
+    expect(slugs).toContain("code-generation");
+    const cg = m.timing.stages.find((s) => s.stage === "code-generation")!;
+    expect(cg.endKind).toBe("in-flight");
+    // Zero-second bootstrap stages must still be counted as completed.
+    const scaffold = m.timing.stages.find((s) => s.stage === "workspace-scaffold")!;
+    expect(scaffold.elapsedSec).toBe(0);
+    expect(scaffold.endKind).toBe("completed");
+  });
+
+  test("intent-capture's 1h gate wait lands in IDLE, not WORK", () => {
+    const ic = m.timing.stages.find((s) => s.stage === "intent-capture")!;
+    expect(ic.idleSec).toBe(3600);
+  });
+
+  test("flags the stale runtime-graph and quantifies the drift", () => {
+    const g = m.provenance["runtime-graph"];
+    expect(g.stale).toBe(true);
+    // Code and facts, not a sentence — the graph holds 1 firing, the audit 3 → 2 missing.
+    expect(g.staleReason).toMatchObject({
+      code: "graph-behind",
+      sensorDrift: { fired: 3, missing: 2 },
+    });
+  });
+
+  test("does NOT flag state.md merely for lagging the audit", () => {
+    expect(m.provenance["state.md"].stale).toBe(false);
+    expect(m.provenance["stage-graph"].stale).toBe(false);
+    expect(m.provenance.audit.stale).toBe(false);
+  });
+
+  test("no warnings on a complete fixture", () => {
+    expect(m.warnings).toEqual([]);
+  });
+});
+
+describe("render", () => {
+  const m = assemble(FIXTURE);
+
+  test("page is self-contained and leaks no placeholders", () => {
+    const html = renderPage(m, 10_000);
+    expect(html.startsWith("<!DOCTYPE html>")).toBe(true);
+    expect(html).toContain("</html>");
+    expect(html).not.toContain("undefined");
+    expect(html).not.toContain("NaN");
+    expect(html).not.toContain("[object Object]");
+  });
+
+  test("surfaces the blocker and the partial cell, with the provenance badge removed", () => {
+    const body = renderBody(m);
+    // The 2×2 grid is gone: its cards became the journey, the ledgers panel and the fold.
+    expect(body).not.toContain('<div class="cards">');
+    expect(body).toContain('id="card-unresolved"');
+    expect(body).not.toContain("primary-col");
+    expect(body).not.toContain('class="full"');
+    expect(body).toContain("PU-B-ui");
+    expect(body).toContain("code-summary");
+    // Regression check: the source badge/popup must be gone from the screen entirely (stale and fresh alike).
+    // The sources line is one summary line, not a badge on each number.
+    expect(body).not.toContain("prov stale");
+    expect(body).not.toContain('class="prov"');
+    expect(body).toContain("c-partial");
+  });
+
+  test("orders the page: hero, journey, KPI tiles with their panels closed, cards, sources", () => {
+    const body = renderBody(m);
+    const at = (needle: string) => {
+      const i = body.indexOf(needle);
+      expect(i).toBeGreaterThanOrEqual(0);
+      return i;
+    };
+    // What waits on the reader, then where the run is, before any figure.
+    expect(at('id="banner"')).toBeLessThan(at('id="journey"'));
+    expect(at('id="journey"')).toBeLessThan(at('class="kpi-tiles"'));
+    // Each tile's full panel sits under the tiles, in tile order, inside ONE closed
+    // <details> — the page opens on the summary.
+    expect(at('class="kpi-tiles"')).toBeLessThan(at('id="kpi-more"'));
+    expect(at('id="kpi-more"')).toBeLessThan(at('id="drill-overview"'));
+    expect(at('id="drill-overview"')).toBeLessThan(at('id="matrix"'));
+    expect(at('id="matrix"')).toBeLessThan(at('id="drill-usage"'));
+    expect(at('id="drill-usage"')).toBeLessThan(at('id="credit"'));
+    expect(at('id="credit"')).toBeLessThan(at('id="drill-timeline"'));
+    expect(at('id="drill-timeline"')).toBeLessThan(at('id="timeline"'));
+    expect(body).not.toMatch(/<details[^>]*id="kpi-more"[^>]* open/);
+    // Then the two cards left — the Stage and Unit cards became the journey — then sources.
+    expect(body).not.toContain('id="card-stage"');
+    expect(body).not.toContain('id="card-unit"');
+    // The ledgers and the folded diagnostics now sit under the time summary, above the
+    // tiles; Run Health and the sources line live inside the fold.
+    expect(at('id="card-unresolved"')).toBeLessThan(at('id="diag"'));
+    expect(at('id="diag"')).toBeLessThan(at('id="card-health"'));
+    expect(at('id="card-health"')).toBeLessThan(at('<div class="sources">'));
+    expect(at('<div class="sources">')).toBeLessThan(at('class="kpi-tiles"'));
+    // The old foot-of-page drill-downs are gone, and the deferrals box is unmounted
+    // (SHOW_DEFERRALS) — with no "see all" link left pointing at it.
+    expect(body).not.toContain('class="drill"');
+    expect(body).not.toContain('id="deferrals"');
+    expect(body).not.toContain('href="#deferrals"');
+    // Every card link lands on something that exists, and the matrix link on the matrix.
+    const links = [...body.matchAll(/<a class="mc-more" href="#([^"]+)"/g)].map((x) => x[1]);
+    expect(links).toEqual(["drill-timeline"]);
+    for (const id of links) at(`id="${id}"`);
+    // The journey's matrix link opens the panel that holds it, then lands on it.
+    expect(body).toContain('<a href="#matrix" data-drill="matrix">');
+    at('id="matrix"');
+  });
+
+  test("with the matrix withheld, the journey's matrix link still lands — on why there is none", () => {
+    const none = { ...m, matrix: undefined };
+    const body = renderBody(none, "ko");
+    expect(body).toContain('href="#matrix"');
+    expect(body.match(/ id="matrix"/g)?.length).toBe(1);
+    const at = body.indexOf(' id="matrix"');
+    expect(body.slice(at, body.indexOf("</section>", at))).toContain(
+      strings("ko").overview.noUnitsPill,
+    );
+  });
+
+  test("the timing panel never prints a day unit", () => {
+    // `d` reads as a WORKING day of about eight hours; the code means a 24-hour
+    // calendar day. On a real run the KPI row said `5.8d team wall clock · 1.2d observed execution` (in Korean),
+    // which reads as "worked about a day" when 1.2d is 28.8 hours — a factor-of-three
+    // error on the number the panel exists to convey. One unit also makes the row
+    // comparable at a glance. The fixture's span is deliberately over 24h, so this
+    // assertion has something to catch.
+    const body = renderBody(m);
+    // Bounded to the timing section itself: other panels follow it in the drill-downs,
+    // and an AGE (how long a deferral has been open) is rightly printed in days.
+    const start = body.indexOf('id="timeline"');
+    const timing = body.slice(start, body.indexOf("</section>", start));
+    expect(m.timing.elapsedSec).toBeGreaterThan(86400);
+    expect(timing).not.toMatch(/\d\.\dd\b/);
+    expect(timing).toContain(`${(m.timing.elapsedSec / 3600).toFixed(1)}h`);
+    // The Stage card's time column is timing too, so it follows the same rule.
+    const stageCard = body.slice(body.indexOf('id="card-stage"'), body.indexOf('id="card-unit"'));
+    expect(stageCard).not.toMatch(/\d\.\dd\b/);
+  });
+
+  test("an age still rolls up to days — that is what the reader is asking", () => {
+    // dur() and hours() are different questions: "how long has this sat" wants days,
+    // "how much time went where" must not. Keep both formatters.
+    expect(dur(200000)).toBe("2.3d");
+    expect(hours(200000)).toBe("55.6h");
+    // Sub-hour resolution survives in both; `0.0h` for 45s would be worse than `45s`.
+    expect(hours(45)).toBe("45s");
+    expect(hours(1500)).toBe("25m");
+  });
+
+  test("Unit Progress: the AND condition, and the table read as the authority", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-team-"));
+    const sp = () =>
+      path.join(root, "aidlc/spaces/default/intents/260101-demo-migration/aidlc-state.md");
+    try {
+      fs.cpSync(FIXTURE, root, { recursive: true });
+      const base = fs.readFileSync(sp(), "utf-8");
+      const withFields = (extra: string, tail = "") => {
+        fs.writeFileSync(
+          sp(),
+          base.replace("- **State Version**: 8", `- **State Version**: 8${extra}`) + tail,
+        );
+        return assemble(root);
+      };
+
+      // Neither field: silent.
+      expect(codes(assemble(root)).some((c) => c.startsWith("unit-progress"))).toBe(false);
+      // `solo` + `unit-major` is a NORMAL run with no such table. It warned when the
+      // condition was an OR, which told a correctly configured run it was missing one.
+      expect(
+        withFields(
+          "\n- **Unit Ownership**: solo\n- **Construction Iteration**: unit-major",
+        ).warnings.some((w) => w.code === "unit-progress-missing"),
+      ).toBe(false);
+      // `team` without `unit-major` is the misconfiguration, and gets its own line.
+      expect(
+        withFields(
+          "\n- **Unit Ownership**: team\n- **Construction Iteration**: stage-major",
+        ).warnings.some((w) => w.code === "team-without-unit-major"),
+      ).toBe(true);
+      // Both, no table: the authority is missing and the matrix is only a reconstruction.
+      const teamOnly = withFields(
+        "\n- **Unit Ownership**: team\n- **Construction Iteration**: unit-major",
+      );
+      expect(codes(teamOnly)).toContain("unit-progress-missing");
+      // Both, WITH the table: parsed and rendered as the authority above the matrix.
+      const withTable = withFields(
+        "\n- **Unit Ownership**: team\n- **Construction Iteration**: unit-major",
+        "\n## Unit Progress\n\n| unit | owner | code-generation | gate |\n| --- | --- | --- | --- |\n| PU-A-core | alex | [x] | [x] |\n",
+      );
+      expect(withTable.state.unitProgress?.rows[0]?.owner).toBe("alex");
+      expect(codes(withTable)).not.toContain("unit-progress-missing");
+      expect(renderBody(withTable, "ko")).toContain("유닛 진행 (state.md 권위)");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  describe("a plan that skips Units Generation runs per-unit stages at stage level", () => {
+    // `usesStageLevelPerUnitArtifacts`: Units Generation neither EXECUTE nor completed
+    // means the per-unit stages run once, writing under `construction/<stage>/`, and the
+    // engine refuses `unit start/complete`. There is no unit to draw a column for.
+    const REC = "aidlc/spaces/default/intents/260101-demo-migration";
+    const withState = (
+      row: string,
+      check: (m: ReturnType<typeof assemble>) => void,
+      opts: {
+        dropDag?: boolean;
+        grid?: Record<string, Record<string, string>>;
+        scope?: string;
+        /** Extra `## Runtime State` field lines. */
+        runtime?: string;
+        /** Extra `## Project Information` field lines. */
+        info?: string;
+        /** A section appended to the state, e.g. `## Unit Progress`. */
+        tail?: string;
+        /** Record-relative files to write. */
+        files?: Record<string, string>;
+        /** The authored unit DAG: removed, or its yaml units block stripped (malformed). */
+        authoredDag?: "drop" | "malformed";
+        /** Literal replacements in the state text, applied last. */
+        replace?: [string, string][];
+        /** Catalogue stages to mark `enabled: false`. */
+        disable?: string[];
+      } = {},
+    ) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-stagelevel-"));
+      try {
+        fs.cpSync(FIXTURE, root, { recursive: true });
+        const sp = path.join(root, REC, "aidlc-state.md");
+        let text = fs.readFileSync(sp, "utf-8").replace("- [x] units-generation — EXECUTE", row);
+        if (opts.scope)
+          text = text.replace("- **Scope**: demo-migration", `- **Scope**: ${opts.scope}`);
+        if (opts.runtime)
+          text = text.replace(
+            "- **Revision Count**: 2",
+            `- **Revision Count**: 2\n${opts.runtime}`,
+          );
+        if (opts.info)
+          text = text.replace("- **State Version**: 8", `- **State Version**: 8\n${opts.info}`);
+        if (opts.tail) text = `${text.trimEnd()}\n\n${opts.tail}\n`;
+        for (const [from, to] of opts.replace ?? []) text = text.replace(from, to);
+        fs.writeFileSync(sp, text);
+        const dep = path.join(root, REC, "inception/units-generation/unit-of-work-dependency.md");
+        if (opts.authoredDag === "drop") fs.rmSync(dep);
+        if (opts.authoredDag === "malformed")
+          fs.writeFileSync(
+            dep,
+            fs.readFileSync(dep, "utf-8").replace(/```yaml[\s\S]*?```\r?\n/, ""),
+          );
+        for (const [rel, body] of Object.entries(opts.files ?? {})) {
+          fs.mkdirSync(path.dirname(path.join(root, REC, rel)), { recursive: true });
+          fs.writeFileSync(path.join(root, REC, rel), body);
+        }
+        if (opts.dropDag) {
+          const gp = path.join(root, REC, "runtime-graph.json");
+          const { bolt_dag: _dropped, ...g } = JSON.parse(fs.readFileSync(gp, "utf-8"));
+          fs.writeFileSync(gp, JSON.stringify(g));
+        }
+        if (opts.disable) {
+          const gp = path.join(root, ".kiro/tools/data/stage-graph.json");
+          const graph = JSON.parse(fs.readFileSync(gp, "utf-8")) as { slug: string }[];
+          fs.writeFileSync(
+            gp,
+            JSON.stringify(
+              graph.map((st) => (opts.disable?.includes(st.slug) ? { ...st, enabled: false } : st)),
+            ),
+          );
+        }
+        if (opts.grid) {
+          const grid = Object.fromEntries(
+            Object.entries(opts.grid).map(([k, stages]) => [k, { stages }]),
+          );
+          fs.writeFileSync(
+            path.join(root, ".kiro/tools/data/scope-grid.json"),
+            JSON.stringify(grid),
+          );
+        }
+        check(assemble(root));
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    };
+
+    test("no unit DAG: the note says the plan skips it, not that it was not reached", () => {
+      withState(
+        "- [ ] units-generation — SKIP",
+        (m) => {
+          expect(m.unitArtifactMode).toBe("stage-level");
+          expect(m.matrix).toBeUndefined();
+          for (const [loc, x] of [
+            ["en", EN],
+            ["ko", KO],
+          ] as const) {
+            const body = renderBody(m, loc);
+            expect(body).toContain(esc(x.overview.stageLevelUnits));
+            expect(body).not.toContain(x.overview.noUnits);
+          }
+        },
+        { dropDag: true },
+      );
+    });
+
+    test("a unit DAG left in the graph draws no column of false absents", () => {
+      // Units Generation compiled a DAG, then the plan dropped it before it completed:
+      // the engine judges `construction/<stage>/`, so a column per unit would read every
+      // cell absent.
+      withState("- [?] units-generation — SKIP", (m) => {
+        expect(m.unitArtifactMode).toBe("stage-level");
+        expect(m.matrix).toBeUndefined();
+        expect(renderBody(m, "en")).toContain(esc(EN.overview.stageLevelUnits));
+        expect(renderJourney(m, EN)).toContain(esc(EN.overview.stageLevelUnits));
+        // The engine's stage-level question reader reads `construction/<stage>/` only, so
+        // a unit's copy of the current stage is a record of earlier work, not what holds
+        // the run — "no unit" is known here, not unknown.
+        const stale = m.blockers.find((b) => b.unit === "PU-B-ui");
+        expect(stale?.stage).toBe("code-generation");
+        expect(stale?.isCurrentStage).toBe(false);
+      });
+    });
+
+    // The run's position, its waits and the Unit Progress card at stage level. The
+    // orchestrator issues a per-unit stage once with `unit: null` there, both unit-major
+    // walks return null, and `unit start/pause/complete` is refused — so a unit cache in
+    // the state is a leftover of an earlier plan, and Current Stage is where routing is.
+    const LEFTOVER = [
+      "- **Construction Iteration**: unit-major",
+      "- **Active Unit**: PU-B-ui",
+      "- **Unit Stage**: code-generation",
+      "- **Unit State**: paused",
+      "- **Unit Pause Reason**: waiting on a key",
+      "- **Unit Next Action**: resume with the key",
+    ].join("\n");
+    // A blank only the stop hook's raw test sees (fenced), in the STAGE-level dir.
+    const STAGE_Q = "construction/code-generation/code-generation-questions.md";
+    const FENCED = "# Questions\n\n```\n## Q1\n[Answer]:\n```\n";
+
+    test("a leftover unit cache places the run on no unit, and Current Stage does not lag", () => {
+      withState(
+        "- [ ] units-generation — SKIP",
+        (m) => {
+          expect(m.waits.position.unit).toBeUndefined();
+          expect(m.waits.position.stage).toBe("code-generation");
+          expect(m.waits.position.verified).toBe(true);
+          expect(m.waits.position.leftoverUnit).toEqual({
+            unit: "PU-B-ui",
+            stage: "code-generation",
+          });
+          for (const [loc, x] of [
+            ["en", EN],
+            ["ko", KO],
+          ] as const) {
+            const line = /<div class="runline"[\s\S]*?<\/div>/.exec(renderBody(m, loc))?.[0] ?? "";
+            expect(line).toContain("Code Generation");
+            expect(line).not.toContain(x.status.runningUnit("PU-B-ui"));
+            expect(line).not.toContain(x.status.runUnverified);
+          }
+        },
+        { dropDag: true, runtime: LEFTOVER },
+      );
+    });
+
+    test("the stage-level questions path is the active one, whatever the unit cache says", () => {
+      withState(
+        "- [ ] units-generation — SKIP",
+        (m) => expect(m.waits.engineOnly).toEqual([STAGE_Q]),
+        { dropDag: true, runtime: LEFTOVER, files: { [STAGE_Q]: FENCED } },
+      );
+    });
+
+    test("a leftover paused unit is said as a leftover, not counted as a wait", () => {
+      withState(
+        "- [ ] units-generation — SKIP",
+        (m) => {
+          expect(m.waits.unitPaused).toBeUndefined();
+          expect(m.waits.unitCacheLeftover).toEqual({
+            unit: "PU-B-ui",
+            stage: "code-generation",
+            paused: true,
+          });
+          for (const [loc, x] of [
+            ["en", EN],
+            ["ko", KO],
+          ] as const) {
+            const body = renderBody(m, loc);
+            expect(body).not.toContain(
+              esc(x.status.humanUnitPaused("PU-B-ui", "waiting on a key")),
+            );
+            expect(body).toContain(
+              esc(x.status.humanUnitCacheLeftover("PU-B-ui", "code-generation", true)),
+            );
+          }
+        },
+        { dropDag: true, runtime: LEFTOVER },
+      );
+    });
+
+    test("team ownership: no unit gate to leave unread, and Unit Progress does not route", () => {
+      const UP = [
+        "## Unit Progress",
+        "<!-- Derived, engine-owned projection; routing ignores hand edits. -->",
+        "| unit | owner | functional-design | code-generation | gate |",
+        "| --- | --- | --- | --- | --- |",
+        "| PU-A-core | main | [x] | [-] | [ ] |",
+      ].join("\n");
+      withState(
+        "- [ ] units-generation — SKIP",
+        (m) => {
+          expect(m.waits.teamGateUnread).toBe(false);
+          for (const [loc, x] of [
+            ["en", EN],
+            ["ko", KO],
+          ] as const) {
+            const body = renderBody(m, loc);
+            expect(body).toContain(esc(x.overview.sectionUnitProgressStageLevel));
+            expect(body).not.toContain(esc(x.overview.sectionUnitProgress));
+            expect(body).toContain(x.overview.unitProgressStageLevelNote);
+          }
+        },
+        {
+          dropDag: true,
+          runtime: LEFTOVER,
+          info: "- **Unit Ownership**: team",
+          tail: UP,
+        },
+      );
+      // With no table and no unit DAG there is nothing missing: the engine derives one
+      // only from a valid non-empty Unit DAG (`resolveBoltDag`, authored file first). Stage
+      // level alone does not prove there is none — derivation does not refuse it — so a
+      // roster that still resolves keeps the warning, as does one only the graph caches.
+      withState(
+        "- [ ] units-generation — SKIP",
+        (m) => expect(m.warnings.map((w) => w.code)).not.toContain("unit-progress-missing"),
+        {
+          dropDag: true,
+          authoredDag: "drop",
+          runtime: LEFTOVER,
+          info: "- **Unit Ownership**: team",
+        },
+      );
+      withState(
+        "- [ ] units-generation — SKIP",
+        (m) => {
+          expect(m.unitDag.state).toBe("malformed");
+          expect(m.warnings.map((w) => w.code)).not.toContain("unit-progress-missing");
+        },
+        { authoredDag: "malformed", runtime: LEFTOVER, info: "- **Unit Ownership**: team" },
+      );
+      withState(
+        "- [?] units-generation — SKIP",
+        (m) => {
+          expect(m.unitArtifactMode).toBe("stage-level");
+          expect(m.warnings.map((w) => w.code)).toContain("unit-progress-missing");
+        },
+        { runtime: LEFTOVER, info: "- **Unit Ownership**: team" },
+      );
+    });
+
+    // #26 checks the unit cache against the roster (`offRoster`). At stage level the cache
+    // is not a position at all — the engine writes none there and the hook never reads it —
+    // so there is nothing to check against a roster, whether one resolves or not.
+    const GHOST = LEFTOVER.replace("- **Active Unit**: PU-B-ui", "- **Active Unit**: PU-ghost");
+
+    test("a cached unit off the roster is a leftover at stage level, not an off-roster position", () => {
+      withState(
+        "- [ ] units-generation — SKIP",
+        (m) => {
+          expect(m.unitDag.state).toBe("ok");
+          expect(m.waits.position.offRoster).toBeUndefined();
+          expect(m.waits.position.unit).toBeUndefined();
+          expect(m.waits.position.verified).toBe(true);
+          expect(m.waits.position.leftoverUnit?.unit).toBe("PU-ghost");
+          const line = /<div class="runline"[\s\S]*?<\/div>/.exec(renderBody(m, "en"))?.[0] ?? "";
+          expect(line).not.toContain(EN.status.runOffRoster("PU-ghost", "absent"));
+        },
+        { runtime: GHOST },
+      );
+      // Per unit the same cache is a position, and #26's check applies.
+      withState(
+        "- [x] units-generation — EXECUTE",
+        (m) => {
+          expect(m.waits.position.unit).toBe("PU-ghost");
+          expect(m.waits.position.offRoster).toBe("absent");
+          expect(m.waits.position.verified).toBe(false);
+        },
+        { runtime: GHOST },
+      );
+    });
+
+    test("an unreadable roster leaves a stage-level position verified", () => {
+      withState(
+        "- [ ] units-generation — SKIP",
+        (m) => {
+          expect(m.unitDag.state).toBe("malformed");
+          expect(m.waits.position.offRoster).toBeUndefined();
+          expect(m.waits.position.verified).toBe(true);
+          expect(m.warnings.map((w) => w.code)).not.toContain("unit-dag-malformed");
+        },
+        { authoredDag: "malformed", runtime: LEFTOVER },
+      );
+    });
+
+    test("a missing Unit Progress at stage level: warned only where the engine could derive one", () => {
+      const team = { runtime: LEFTOVER, info: "- **Unit Ownership**: team" };
+      // A roster resolves and per-unit stages still run: the table is derivable and absent.
+      // The warning says so without pointing at a matrix this mode does not draw.
+      withState(
+        "- [ ] units-generation — SKIP",
+        (m) => {
+          const w = m.warnings.find((x) => x.code === "unit-progress-missing");
+          expect(w).toEqual({ code: "unit-progress-missing", stageLevel: true });
+          if (!w) throw new Error("no unit-progress-missing warning");
+          for (const x of [EN, KO])
+            expect(warningTextIn(w, x)).toBe(x.warn.unitProgressMissing(true));
+          expect(EN.warn.unitProgressMissing(true)).not.toContain("matrix");
+        },
+        team,
+      );
+      // Every per-unit Construction stage skipped at runtime: `deriveTeamUnitProgressModel`
+      // refuses an empty block, so nothing is missing.
+      withState(
+        "- [ ] units-generation — SKIP",
+        (m) => expect(m.warnings.map((w) => w.code)).not.toContain("unit-progress-missing"),
+        {
+          ...team,
+          replace: [
+            ["- [x] functional-design — EXECUTE", "- [S] functional-design — EXECUTE"],
+            ["- [-] code-generation — EXECUTE", "- [S] code-generation — EXECUTE"],
+          ],
+        },
+      );
+    });
+
+    test("a stale Unit Progress at stage level: the label first, then the stale note", () => {
+      // The table names PU-A-core only; the roster has PU-A-core and PU-B-ui.
+      const UP = [
+        "## Unit Progress",
+        "| unit | owner | functional-design | code-generation | gate |",
+        "| --- | --- | --- | --- | --- |",
+        "| PU-A-core | main | [x] | [-] | [ ] |",
+      ].join("\n");
+      const opts = { runtime: LEFTOVER, info: "- **Unit Ownership**: team", tail: UP };
+      withState(
+        "- [ ] units-generation — SKIP",
+        (m) => {
+          expect(m.unitProgressStale).toEqual({ kind: "roster", missing: ["PU-B-ui"], extra: [] });
+          for (const [loc, x] of [
+            ["en", EN],
+            ["ko", KO],
+          ] as const) {
+            const body = renderBody(m, loc);
+            const label = body.indexOf(x.overview.unitProgressStageLevelNote);
+            const stale = body.indexOf(
+              esc(x.overview.unitProgressStaleRoster(["PU-B-ui"], [], false)),
+            );
+            expect(label).toBeGreaterThan(-1);
+            expect(stale).toBeGreaterThan(label);
+            // The only `next`-time writer of the table is the team unit-major router, which a
+            // stage-level plan returns before reaching — so no rewrite is promised.
+            expect(body).not.toContain(
+              esc(x.overview.unitProgressStaleRoster(["PU-B-ui"], [], true)),
+            );
+          }
+        },
+        opts,
+      );
+      withState(
+        "- [x] units-generation — EXECUTE",
+        (m) => {
+          const body = renderBody(m, "en");
+          expect(body).toContain(esc(EN.overview.sectionUnitProgress));
+          expect(body).toContain(esc(EN.overview.unitProgressStaleRoster(["PU-B-ui"], [], true)));
+        },
+        opts,
+      );
+    });
+
+    test("per unit, the same unit cache still places the run", () => {
+      withState(
+        "- [x] units-generation — EXECUTE",
+        (m) => {
+          expect(m.unitArtifactMode).toBe("per-unit");
+          expect(m.waits.position.unit).toBe("PU-B-ui");
+          expect(m.waits.unitPaused?.unit).toBe("PU-B-ui");
+          expect(m.waits.unitCacheLeftover).toBeUndefined();
+        },
+        { runtime: LEFTOVER },
+      );
+    });
+
+    test("a disabled stage is not in the order the engine walks (loadStageGraph)", () => {
+      // The runtime-skipped Units Generation the cursor has passed reads stage level — but
+      // the engine drops an `enabled: false` stage from its graph, so with it disabled the
+      // cursor has passed nothing and the run keeps its units.
+      withState("- [S] units-generation — EXECUTE", (m) =>
+        expect(m.unitArtifactMode).toBe("stage-level"),
+      );
+      withState(
+        "- [S] units-generation — EXECUTE",
+        (m) => expect(m.unitArtifactMode).toBe("per-unit"),
+        { disable: ["units-generation"] },
+      );
+    });
+
+    test("Units Generation that already completed keeps its units (#1401)", () => {
+      withState("- [x] units-generation — SKIP", (m) => {
+        expect(m.unitArtifactMode).toBe("per-unit");
+        expect(m.matrix?.units.map((u) => u.name)).toEqual(["PU-A-core", "PU-B-ui"]);
+      });
+    });
+
+    test("a row with no suffix takes the scope grid's action", () => {
+      withState("- [ ] units-generation", (m) => expect(m.unitArtifactMode).toBe("stage-level"), {
+        grid: { bugfix: { "units-generation": "SKIP" } },
+        scope: "bugfix",
+      });
+      withState("- [ ] units-generation", (m) => expect(m.unitArtifactMode).toBe("per-unit"), {
+        grid: { full: { "units-generation": "EXECUTE" } },
+        scope: "full",
+      });
+    });
+
+    test("no suffix and no grid action claims neither mode, and keeps the matrix", () => {
+      withState("- [ ] units-generation", (m) => {
+        expect(m.unitArtifactMode).toBe("unknown");
+        expect(m.matrix?.units.length).toBe(2);
+        // Drawn as before — and the page says the placement it assumed was not read.
+        expect(renderBody(m, "en")).toContain(esc(EN.overview.unitModeUnknown));
+        expect(renderBody(m, "ko")).toContain(esc(KO.overview.unitModeUnknown));
+      });
+      // A readable plan action says nothing extra.
+      withState("- [x] units-generation — EXECUTE", (m) =>
+        expect(renderBody(m, "en")).not.toContain(esc(EN.overview.unitModeUnknown)),
+      );
+    });
+  });
+
+  test("a shard the engine refuses is left out, and the page names it", () => {
+    // Swap the second clone's shard for a symlink to a copy of itself: the engine reads
+    // the ledger without it, so this reader must too — and say so.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-link-"));
+    const audit = path.join(root, "aidlc/spaces/default/intents/260101-demo-migration/audit");
+    try {
+      fs.cpSync(FIXTURE, root, { recursive: true });
+      const before = assemble(root);
+      expect(codes(before)).not.toContain("audit-shard-refused");
+      const shard = path.join(audit, "other-clone-99887766aabb.md");
+      const copy = path.join(root, "elsewhere.md");
+      fs.renameSync(shard, copy);
+      fs.symlinkSync(copy, shard);
+      const after = assemble(root);
+      expect(after.warnings).toContainEqual({
+        code: "audit-shard-refused",
+        paths: [path.relative(root, shard)],
+      });
+      expect(after.totalEvents).toBeLessThan(before.totalEvents);
+      expect(renderBody(after)).toContain(path.relative(root, shard));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  describe("a partly refused ledger does not make claims about the whole run", () => {
+    // The fixture's second clone holds the run's only GATE_REJECTED. Refuse that shard
+    // and the readable rest has no rejection at all — which the rework panel used to
+    // print as "every gate passed first time", under the very warning that said a
+    // shard was not read.
+    const EN = strings("en");
+    const withAudit = (
+      change: (audit: string, root: string) => void,
+      check: (m: ReturnType<typeof assemble>) => void,
+    ) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-part-"));
+      const audit = path.join(root, "aidlc/spaces/default/intents/260101-demo-migration/audit");
+      try {
+        fs.cpSync(FIXTURE, root, { recursive: true });
+        change(audit, root);
+        check(assemble(root));
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    };
+    const link = (audit: string, root: string, name: string) => {
+      const shard = path.join(audit, name);
+      const copy = path.join(root, `moved-${name}`);
+      fs.renameSync(shard, copy);
+      fs.symlinkSync(copy, shard);
+    };
+    const OTHER = "other-clone-99887766aabb.md";
+    const OWN = "demo-host-aabbccdd1122.md";
+
+    test("one shard refused, one read: the rework claim is hedged, in both languages", () => {
+      withAudit(
+        (audit, root) => link(audit, root, OTHER),
+        (m) => {
+          expect(m.partialAudit).toEqual({ notRead: 1 });
+          expect(m.rework.rejected).toBe(0);
+          const en = renderBody(m, "en");
+          const ko = renderBody(m, "ko");
+          expect(en).not.toContain(esc(EN.timeline.reworkNone(m.rework.approved)));
+          expect(ko).not.toContain(esc(KO.timeline.reworkNone(m.rework.approved)));
+          expect(en).toContain(EN.timeline.reworkNonePartial(1));
+          expect(ko).toContain(KO.timeline.reworkNonePartial(1));
+          expect(en).toContain(EN.timeline.partialAuditNote(1));
+          // "Nothing in flight" and "no spans" are claims about the ledger too.
+          const settled = {
+            ...m,
+            timing: {
+              ...m.timing,
+              stages: m.timing.stages.map((sp) =>
+                sp.endKind === "in-flight" ? { ...sp, endKind: "completed" as const } : sp,
+              ),
+            },
+          };
+          expect(renderBody(settled, "en")).not.toContain(`>${EN.timeline.noneInFlight} · `);
+          expect(renderBody(settled, "en")).toContain(EN.timeline.noneInFlightPartial(1));
+          const spanless = { ...m, timing: { ...m.timing, stages: [] } };
+          expect(renderBody(spanless, "en")).not.toContain(EN.timeline.noStageSpans);
+          expect(renderBody(spanless, "en")).toContain(EN.timeline.noStageSpansPartial(1));
+          // The note stands first, so the early return keeps it too.
+          expect(renderBody(spanless, "en")).toContain(EN.timeline.partialAuditNote(1));
+          // The run line's age is the newest row READ; the run may be writing elsewhere.
+          expect(en).toContain(esc(EN.status.runTipPartial(1)));
+          expect(en).not.toContain(esc(EN.status.runTip));
+          // A readable shard with no rows says "none read", not "none".
+          const empty = {
+            ...spanless,
+            timing: { ...spanless.timing, bins: [], firstTs: undefined },
+          };
+          expect(renderBody(empty, "en")).toContain(esc(EN.tsum.emptyPartial(1)));
+          expect(renderBody(empty, "en")).not.toContain(`>${esc(EN.tsum.empty)} · `);
+        },
+      );
+    });
+
+    test("the same readable ledger with nothing refused keeps the categorical claim", () => {
+      withAudit(
+        (audit) => fs.rmSync(path.join(audit, OTHER)),
+        (m) => {
+          expect(m.partialAudit).toBeUndefined();
+          const en = renderBody(m, "en");
+          expect(en).toContain(esc(EN.timeline.reworkNone(m.rework.approved)));
+          expect(en).not.toContain(EN.timeline.reworkNonePartial(1));
+          expect(en).not.toContain(EN.timeline.partialAuditNote(1));
+        },
+      );
+    });
+
+    test("every shard refused hedges too — nothing read is not nothing recorded", () => {
+      withAudit(
+        (audit, root) => {
+          link(audit, root, OTHER);
+          link(audit, root, OWN);
+        },
+        (m) => {
+          expect(m.partialAudit).toEqual({ notRead: 2 });
+          expect(codes(m)).toContain("audit-shard-refused");
+          const en = renderBody(m, "en");
+          expect(en).toContain(EN.timeline.partialAuditNote(2));
+          expect(en).toContain(EN.timeline.noStageSpansPartial(2));
+          expect(en).not.toContain(EN.timeline.noStageSpans);
+          expect(en).toContain(EN.status.checksNonePartial(2));
+          expect(en).not.toContain(`>${EN.status.checksNone}<`);
+          expect(en).toContain(esc(EN.tsum.emptyPartial(2)));
+          expect(en).not.toContain(`>${esc(EN.tsum.empty)} · `);
+        },
+      );
+    });
+
+    // Unreadable is not refused, but it is not read either: the same hedge, its own warning.
+    const unreadable = process.platform !== "win32" && process.getuid?.() !== 0;
+    test.skipIf(!unreadable)(
+      "a listed shard that cannot be read hedges like a refusal and says so",
+      () => {
+        withAudit(
+          (audit) => fs.chmodSync(path.join(audit, OTHER), 0o000),
+          (m) => {
+            expect(m.partialAudit).toEqual({ notRead: 1 });
+            expect(codes(m)).toContain("audit-shard-unread");
+            expect(codes(m)).not.toContain("audit-shard-refused");
+            expect(renderBody(m, "en")).toContain(EN.timeline.partialAuditNote(1));
+          },
+        );
+      },
+    );
+
+    test.skipIf(!unreadable)("every shard unreadable is not an empty ledger", () => {
+      withAudit(
+        (audit) => {
+          fs.chmodSync(path.join(audit, OTHER), 0o000);
+          fs.chmodSync(path.join(audit, OWN), 0o000);
+        },
+        (m) => {
+          expect(m.partialAudit).toEqual({ notRead: 2 });
+          expect(codes(m)).toContain("audit-shard-unread");
+          expect(codes(m)).not.toContain("audit-empty");
+        },
+      );
+    });
+  });
+
+  test("a declared State Version mismatch BLOCKS the contract, it does not just warn", () => {
+    // Warning and then handing the matrix the same catalogue was the worst of both: the
+    // page said the two sources disagree and then judged the cells against the newer
+    // contract regardless. The harness declares the schema it supports in its own
+    // aidlc-lib.ts, so the number is read from the tree, never pinned in this repo.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-vm-"));
+    try {
+      fs.cpSync(FIXTURE, root, { recursive: true });
+      // The fixture's state says 8 and its harness declares nothing, so it is silent.
+      expect(assemble(root).matrix?.contractAware).toBe(true);
+      fs.writeFileSync(
+        path.join(root, ".kiro/tools/aidlc-lib.ts"),
+        'export const CURRENT_STATE_VERSION = "9";\n',
+      );
+      const m = assemble(root);
+      const warn = m.warnings.find((w) => w.code === "state-version-mismatch");
+      expect(warn).toMatchObject({ stateVersion: "8", harnessVersion: "9" });
+      expect(m.matrix?.contractAware).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an unreadable State Version is reported but does NOT block", () => {
+    // Missing/empty/non-numeric is `unparseable` to the engine and refused — worth
+    // saying. But it is no evidence the ROSTER diverged, and blocking on a missing label
+    // alone would degrade the matrix to 2-state, which hides blocked units.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-vu-"));
+    try {
+      fs.cpSync(FIXTURE, root, { recursive: true });
+      const sp = path.join(
+        root,
+        "aidlc/spaces/default/intents/260101-demo-migration/aidlc-state.md",
+      );
+      fs.writeFileSync(
+        sp,
+        fs.readFileSync(sp, "utf-8").replace("- **State Version**: 8", "- **State Version**: "),
+      );
+      const m = assemble(root);
+      expect(codes(m)).toContain("state-version-unreadable");
+      // Two axes: the contract is still shown, the engine-equivalence claim is withheld.
+      expect(m.matrix?.contractAware).toBe(true);
+      expect(m.matrix?.stateCompat).toBe("unknown");
+      expect(renderBody(m, "ko")).toContain("확인되지 않은 계약");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a stage the catalogue does not know is a version mismatch, and it is loud", () => {
+    // The engine refuses a state whose version does not match the compiled graph
+    // (aidlc-lib.ts classifyStateVersion) — v2.7 renamed `application-design` to
+    // `domain-design`, so a pre-v8 state read against a v8 graph makes every contract
+    // judgement below it wrong. Detected from the ROSTER, not from a pinned number: a
+    // hardcoded `8` goes stale exactly as the STAGE_DISPLAY table did.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-ver-"));
+    try {
+      fs.cpSync(FIXTURE, root, { recursive: true });
+      const statePath = path.join(
+        root,
+        "aidlc/spaces/default/intents/260101-demo-migration/aidlc-state.md",
+      );
+      const before = assemble(root);
+      expect(codes(before)).not.toContain("roster-mismatch");
+      fs.writeFileSync(
+        statePath,
+        fs
+          .readFileSync(statePath, "utf-8")
+          .replace("] code-generation —", "] application-design —"),
+      );
+      const after = assemble(root);
+      const warn = after.warnings.find((w) => w.code === "roster-mismatch");
+      expect(warn).toMatchObject({ unknownToCatalog: ["application-design"], stateVersion: "8" });
+      // And the matrix stops claiming contract-awareness rather than judging cells
+      // against a contract from a different graph generation.
+      expect(after.matrix?.contractAware).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the deferral panel names the route, the limit and the count", () => {
+    const body = withDeferrals(m);
+    expect(body).toContain("미뤄둔 결정");
+    expect(body).toContain("지난 단계로 배정됨 · 2건");
+    expect(body).toContain("현재 단계가 물어야 할 것 · 1건");
+    // Every row shows origin → assigned stage, so the reader judges direction.
+    expect(body).toContain('<span class="dfr-from">units-generation</span> →');
+    expect(body).toContain('<span class="dfr-to">code-generation</span>');
+    // The one thing the ledger cannot show has to be said, not implied.
+    expect(body).toContain("답이 보이지 않는다는 뜻");
+    expect(body).toContain("다시 물어올 것");
+    // 0 goes mute rather than shouting in the urgent colour.
+    expect(body).toContain('class="dfr-chip t-zero"');
+    // One row per ledger, each naming where it was read — six equal tiles used to
+    // assert that all six numbers measured the same thing.
+    expect(body).toContain("산출물 미결");
+    expect(body).toContain("합산하지 않습니다");
+    // No ahead items in this fixture → no empty toggle inviting a dead click.
+    expect(body).not.toContain("예정 단계로 배정됨");
+    expect(body).toContain("확인되지 않은 전제 3건");
+    expect(body).toContain("배정된 자리별 집계");
+    // Assignment cells arrive backticked; they render inside <code> without them.
+    expect(body).toContain("<code>code-generation (NEW-codegen-layout)</code>");
+  });
+
+  test("the stage-declared open questions render as their own ledger, unassigned", () => {
+    // requirements-analysis and contract-design write Open questions in their own
+    // primary artifact, outside `## Assumptions & Open Questions`; on run E five items
+    // lived there and the panel showed none of them.
+    const body = withDeferrals(m);
+    expect(body).toContain("stage 선언 미결 질문");
+    expect(body).toContain("stage 산출물이 직접 선언한 미결 질문 3건 — 배정 없음");
+    expect(body).toContain("OQ1: The retention window for migrated records");
+    expect(body).toContain("Is an empty store an empty list or an explicit signal?");
+    expect(body).toContain("막는 대상 <code>PU-B-ui</code>");
+    // Not summed with the owner-bearing items: those counts are what they were.
+    expect(body).toContain("지난 단계로 배정됨 · 2건");
+    expect(m.deferrals.items.some((i) => i.item.includes("retention window"))).toBe(false);
+    const en = withDeferrals(m, "en");
+    expect(en).toContain("stage-declared open questions");
+    expect(en).toContain("blocks <code>PU-B-ui</code>");
+  });
+
+  test("an unreadable ledger section is reported beside the items that were read", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-dfr-gap-"));
+    try {
+      fs.cpSync(FIXTURE, root, { recursive: true });
+      const record = path.join(root, "aidlc/spaces/default/intents/260101-demo-migration");
+      fs.writeFileSync(
+        path.join(record, "inception/units-generation/unit-of-work-dependency.md"),
+        "## Assumptions & Open Questions\n\n산문으로만 적은 절이다.\n",
+      );
+      fs.writeFileSync(
+        path.join(record, "inception/contract-design/contract-summary.md"),
+        "## Open Questions\n\n남은 계약 질문은 설계에서 다룬다.\n",
+      );
+      const after = assemble(root);
+      expect(after.deferrals.items.length).toBeGreaterThan(0);
+      const body = withDeferrals(after);
+      expect(body).toContain("절 1곳은 이 리더가 아는 모양이 아닙니다");
+      expect(body).toContain("<code>inception/units-generation/unit-of-work-dependency.md</code>");
+      expect(body).toContain(
+        "<code>inception/contract-design/contract-summary.md</code>의 <code>Open questions</code> 절은",
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  describe("a record file that exists and cannot be read is named on the page", () => {
+    // A failed read used to be skipped like an absent file, so the panels built on
+    // what was left said "none". Each case below is the same tree with the file
+    // DELETED as its negative control: absence stays silent, a failure does not.
+    const EN = strings("en");
+    const RECORD = "aidlc/spaces/default/intents/260101-demo-migration";
+    const AOQ = "inception/units-generation/unit-of-work-dependency.md";
+    const QFILE = "construction/PU-B-ui/code-generation/code-generation-questions.md";
+    const DIARY = "ideation/intent-capture/memory.md";
+    const noLinks = process.platform === "win32";
+    const noModes = noLinks || process.getuid?.() === 0;
+    const withTree = (
+      change: (record: string) => void,
+      check: (m: ReturnType<typeof assemble>) => void,
+    ) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-unread-"));
+      const record = path.join(root, RECORD);
+      try {
+        fs.cpSync(FIXTURE, root, { recursive: true });
+        change(record);
+        check(assemble(root));
+      } finally {
+        for (const rel of [QFILE, DIARY, AOQ]) {
+          try {
+            if (!fs.lstatSync(path.join(record, rel)).isSymbolicLink()) {
+              fs.chmodSync(path.join(record, rel), 0o644);
+            }
+          } catch {}
+        }
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    };
+    const toDir = (record: string, rel: string) => {
+      fs.rmSync(path.join(record, rel));
+      fs.mkdirSync(path.join(record, rel));
+    };
+    // Every A&OQ section `None.` and both declared ledgers `None.`, so the deferrals
+    // panel reaches the branch that prints its "no open items" pill.
+    const allNone = (record: string) => {
+      for (const rel of [
+        AOQ,
+        "construction/PU-A-core/functional-design/business-rules.md",
+        "construction/PU-B-ui/functional-design/frontend-components.md",
+        "ideation/intent-capture/intent-capture-questions.md",
+      ]) {
+        fs.writeFileSync(path.join(record, rel), "## Assumptions & Open Questions\n\nNone.\n");
+      }
+      for (const rel of [
+        "inception/requirements-analysis/requirements.md",
+        "inception/contract-design/contract-summary.md",
+      ]) {
+        fs.writeFileSync(path.join(record, rel), "## Open Questions\n\nNone.\n");
+      }
+    };
+    const pill = `>${EN.deferrals.noOpenPill}<`;
+    const noDiary = (m: ReturnType<typeof assemble>) => ({
+      ...m,
+      diaries: { ...m.diaries, records: [] },
+    });
+
+    test("an A&OQ artifact that is a directory withholds the pill and is named", () => {
+      withTree(
+        (record) => {
+          allNone(record);
+          toDir(record, AOQ);
+        },
+        (m) => {
+          expect(m.warnings).toContainEqual({
+            code: "record-file-unreadable",
+            files: [AOQ],
+            questions: false,
+          });
+          const body = withDeferrals(noDiary(m), "en");
+          expect(body).not.toContain(pill);
+          expect(body).toContain(EN.deferrals.aoqUnreadable(`<code>${AOQ}</code>`));
+        },
+      );
+    });
+
+    test("the Unresolved card does not say 'none' for a ledger it could not wholly read", () => {
+      withTree(
+        (record) => {
+          allNone(record);
+          toDir(record, AOQ);
+        },
+        (m) => {
+          const card = renderUnresolved(noDiary(m), EN);
+          expect(card).not.toContain(EN.cards.noDecisions);
+          expect(card).toContain(EN.cards.notAllRead);
+          expect(card).toContain(">0+<");
+        },
+      );
+    });
+
+    test("the only A&OQ artifact unreadable does not say no artifact carries one", () => {
+      withTree(
+        (record) => {
+          // AOQ is the one artifact left with the section; the rest carry none.
+          for (const rel of [
+            "construction/PU-A-core/functional-design/business-rules.md",
+            "construction/PU-B-ui/functional-design/frontend-components.md",
+            "ideation/intent-capture/intent-capture-questions.md",
+            "inception/requirements-analysis/requirements.md",
+            "inception/contract-design/contract-summary.md",
+          ]) {
+            fs.writeFileSync(path.join(record, rel), "# notes\n");
+          }
+          toDir(record, AOQ);
+        },
+        (m) => {
+          expect(m.deferrals.sections).toBe(0);
+          const body = withDeferrals(m, "en");
+          expect(body).toContain(EN.deferrals.noSections(m.deferrals.artifacts, 1));
+          expect(body).not.toContain(EN.deferrals.noSections(m.deferrals.artifacts, 0));
+        },
+      );
+    });
+
+    test("the same artifact deleted keeps the pill and warns nothing (negative control)", () => {
+      withTree(
+        (record) => {
+          allNone(record);
+          fs.rmSync(path.join(record, AOQ));
+        },
+        (m) => {
+          expect(m.warnings.map((w) => w.code)).not.toContain("record-file-unreadable");
+          expect(withDeferrals(noDiary(m), "en")).toContain(pill);
+        },
+      );
+    });
+
+    test("a stage diary that is a directory withholds the pill", () => {
+      withTree(
+        (record) => {
+          allNone(record);
+          toDir(record, DIARY);
+        },
+        (m) => {
+          expect(m.warnings).toContainEqual({
+            code: "record-file-unreadable",
+            files: [DIARY],
+            questions: false,
+          });
+          // The rest of the diaries are read, but one that could not be may hold an
+          // open question, so the panel cannot say "no open items".
+          expect(withDeferrals(noDiary(m), "en")).not.toContain(pill);
+        },
+      );
+    });
+
+    test.skipIf(noModes)("a questions file with no read permission is a floor, not a zero", () => {
+      withTree(
+        (record) => fs.chmodSync(path.join(record, QFILE), 0o000),
+        (m) => {
+          expect(m.warnings).toContainEqual({
+            code: "record-file-unreadable",
+            files: [QFILE],
+            questions: true,
+          });
+          const body = withDeferrals(m, "en");
+          expect(body).toContain(EN.status.humanUnreadable(1));
+          expect(body).toContain(EN.warn.recordFileUnreadable([QFILE], true));
+          // Not a floor: an unread file can also un-explain a marker's ask, so the
+          // count is marked incomplete rather than "N+".
+          expect(body).toMatch(/class="mc-n warn">\d+\?</);
+          // A finished run lists its loose ends, and this is one of them.
+          const done = { ...m, state: { ...m.state, complete: true } };
+          expect(withDeferrals(done, "en")).toContain(EN.status.humanUnreadable(1));
+        },
+      );
+    });
+
+    test.skipIf(noLinks)(
+      "a dangling questions-file link keeps 'nothing awaiting you' off the page",
+      () => {
+        withTree(
+          (record) => {
+            fs.rmSync(path.join(record, QFILE));
+            fs.symlinkSync(path.join(record, "nowhere.md"), path.join(record, QFILE));
+          },
+          (m) => {
+            expect(m.questions.unreadable).toEqual([QFILE]);
+            // The picker card reads the same walk, and carries the floor with it.
+            const summary = readWorkspaceSummary(m.identity.root);
+            expect(summary.kind === "ok" ? summary.blockers.unreadable : -1).toBe(1);
+            // Strip every other hold — the fixture's one blocker lives in this very file,
+            // and its hooks read stale — so the unread file is the only thing left.
+            const bare = {
+              ...m,
+              blockers: [],
+              waits: { ...m.waits, hooks: { state: "live" as const } },
+            };
+            const body = withDeferrals(bare, "en");
+            expect(body).toContain(EN.status.humanUnreadable(1));
+            expect(body).not.toContain(EN.status.humanNone);
+            // Positive control: with nothing unread, the same bare model is "nothing".
+            const read = { ...bare, questions: { ...bare.questions, unreadable: [] } };
+            expect(withDeferrals(read, "en")).toContain(EN.status.humanNone);
+          },
+        );
+      },
+    );
+  });
+
+  test("the ok pill is withheld while any other ledger is open or unread", () => {
+    // All A&OQ sections `None.` — but the pill says "no open items" for the panel, so a
+    // declared ledger that could not be read, or an open diary entry, must withhold it.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-dfr-pill-"));
+    try {
+      fs.cpSync(FIXTURE, root, { recursive: true });
+      const record = path.join(root, "aidlc/spaces/default/intents/260101-demo-migration");
+      for (const rel of [
+        "inception/units-generation/unit-of-work-dependency.md",
+        "construction/PU-A-core/functional-design/business-rules.md",
+        "construction/PU-B-ui/functional-design/frontend-components.md",
+        "ideation/intent-capture/intent-capture-questions.md",
+      ]) {
+        fs.writeFileSync(path.join(record, rel), "## Assumptions & Open Questions\n\nNone.\n");
+      }
+      fs.writeFileSync(
+        path.join(record, "inception/requirements-analysis/requirements.md"),
+        "## Open Questions\n\n남은 질문은 설계에서 다룬다.\n",
+      );
+      fs.writeFileSync(
+        path.join(record, "inception/contract-design/contract-summary.md"),
+        "## Open Questions\n\nNone.\n",
+      );
+      const pill = strings("ko").deferrals.noOpenPill;
+      const unread = assemble(root);
+      // The empty branch, or the pill assertions below would pass vacuously.
+      expect(unread.deferrals.items).toEqual([]);
+      expect(unread.deferrals.assumptions).toEqual([]);
+      expect(unread.deferrals.declared.ledgers.map((l) => l.status)).toEqual(["unread", "none"]);
+      expect(withDeferrals(unread)).not.toContain(`>${pill}<`);
+      fs.writeFileSync(
+        path.join(record, "inception/requirements-analysis/requirements.md"),
+        "## Open Questions\n\nNone.\n",
+      );
+      const clear = assemble(root);
+      const open = clear.diaries.records.filter(
+        (r) => r.axis === "openQuestions" && r.questionStatus !== "resolved",
+      );
+      // The fixture's diaries carry open entries, so the pill stays withheld…
+      expect(open.length).toBeGreaterThan(0);
+      expect(withDeferrals(clear)).not.toContain(`>${pill}<`);
+      // …and appears once nothing anywhere is open (positive control).
+      const none = { ...clear, diaries: { ...clear.diaries, records: [] } };
+      expect(withDeferrals(none)).toContain(`>${pill}<`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the stage-diary card is gone, and no empty slot is left where it was", () => {
+    // The decisions-and-issues card read memory.md — what the ORCHESTRATOR thought — and measured
+    // against the deferral ledger on a real run it shared zero files and zero item
+    // text with it, while naming nothing the run still owed. Both panels in
+    // render/health.ts are now behind SHOW_ flags, and renderBody no longer mounts
+    // renderHealth at all — the retired panels have no slot to leave blank.
+    const body = renderBody(m);
+    expect(renderHealth(m, strings("ko"))).toBe("");
+    expect(body).not.toContain("결정과 이슈");
+    expect(body).not.toContain("후속 확인 후보");
+    expect(body).not.toContain("Stage별 전체 기록");
+    expect(body).not.toContain("감사 원장");
+    // The diary still assembles: /api/model keeps it, like sensors and hook health.
+    expect(m.diaries.records.length).toBe(6);
+  });
+
+  test("escapes HTML from run content (credit warning)", () => {
+    // Re-anchored (team.md ## Testing Posture): the removed top blocker card is
+    // replaced by the credit view, which now sits at the top and carries the ONE
+    // non-contract external text this dashboard shows — kiro-cli /usage output
+    // (warning.raw / warning.reason). Hostile markup there must be escaped by
+    // renderBody just as the blocker heading used to be.
+    if (m.usage.kind !== "kiro") throw new Error("fixture should resolve to the kiro panel");
+    const hostile = {
+      ...m,
+      usage: {
+        kind: "kiro" as const,
+        credit: {
+          ...m.usage.credit,
+          status: "failure" as const,
+          warning: {
+            raw: '<script>alert("x")</script>',
+            reason: '<img src=x onerror="alert(1)">',
+          },
+        },
+      },
+    };
+    const body = renderBody(hostile as typeof m);
+    expect(body).not.toContain("<script>alert");
+    expect(body).not.toContain("<img src=x");
+    expect(body).toContain("&lt;script&gt;");
+  });
+
+  test("renders with auto-polling disabled", () => {
+    expect(renderPage(m, 0)).toContain("auto-poll disabled");
+  });
+
+  test("shows the per-worker table and explains the merged/per-worker split", () => {
+    const body = renderBody(m, "ko");
+    expect(body).toContain("작업자별 분해");
+    // The fixture's shards do not overlap, so the panel must say handover rather
+    // than claim parallel development, and must NOT print a concurrency ratio.
+    expect(body).toContain("순차 인계");
+    expect(body).not.toContain("실효 병렬도");
+    expect(body).toContain("팀 벽시계"); // merged KPI relabelled
+    expect(body).toContain("팀 단위"); // merged row is labelled as team-wide
+    expect(body).toContain("사용자 대기");
+    expect(body).toContain("일시중지");
+    expect(body).toContain("관측 실행");
+    expect(body).toContain("미분류");
+    expect(body).toContain("주도"); // the gate-driving clone is flagged
+    // The fixture is the handoff case (merged idle > per-worker), so the note
+    // must explain THAT direction rather than claiming under-reporting.
+    expect(body).toContain("인계 공백");
+    expect(body).not.toContain("과소계상");
+  });
+
+  test("hides the per-worker table for a single-clone run", () => {
+    const solo = {
+      ...m,
+      timing: { ...m.timing, parallel: false, workers: [m.timing.workers[0]] },
+    };
+    const body = renderBody(solo as typeof m);
+    expect(body).not.toContain("작업자별 분해");
+    expect(body).not.toContain("과소계상");
+  });
+});
+
+describe("absence sentences claim only what their source read", () => {
+  const EN = strings("en");
+  const KO = strings("ko");
+  const base = assemble(FIXTURE);
+  const quiet = { ...base.rework, rejected: 0, revisions: 0, jumps: 0, reopened: 0 };
+
+  test("no rejection and no approval is not every gate passing first time", () => {
+    const m = { ...base, rework: { ...quiet, approved: 0 } };
+    for (const lang of ["en", "ko"] as const) {
+      const t = strings(lang).timeline;
+      const html = renderBody(m, lang);
+      expect(html).toContain(esc(t.reworkNone(0)));
+    }
+    const en = renderBody(m, "en");
+    expect(en).not.toContain("every gate passed first time");
+    expect(renderBody(m, "ko")).not.toContain("모든 관문을 한 번에 통과");
+  });
+
+  test("with approvals, the first-time claim is scoped to the gates approved so far", () => {
+    const m = { ...base, rework: { ...quiet, approved: 3 } };
+    expect(renderBody(m, "en")).toContain(esc(EN.timeline.reworkNone(3)));
+    expect(renderBody(m, "ko")).toContain(esc(KO.timeline.reworkNone(3)));
+    expect(EN.timeline.reworkNone(3)).toContain("3");
+    expect(EN.timeline.reworkNone(3)).not.toContain("every gate passed");
+  });
+
+  test("an open decision is named on the timeline line, not denied", () => {
+    const m = {
+      ...base,
+      waits: {
+        ...base.waits,
+        decision: {
+          stage: "code-generation",
+          unit: "PU-A-core",
+          checkpoint: "Construction Unit Approval",
+          since: "2026-01-01T03:00:00Z",
+        },
+      },
+    };
+    const en = renderBody(m, "en");
+    expect(en).toContain(EN.timeline.awaitingDecision("Construction Unit Approval"));
+    expect(en).not.toContain(EN.timeline.awaitingNone);
+    expect(renderBody(m, "ko")).toContain(
+      KO.timeline.awaitingDecision("Construction Unit Approval"),
+    );
+    const unnamed = {
+      ...m,
+      waits: { ...m.waits, decision: { stage: "code-generation", since: "2026-01-01T03:00:00Z" } },
+    };
+    expect(renderBody(unnamed, "en")).toContain(EN.timeline.awaitingDecision(undefined));
+  });
+
+  test("a decision scoped by the unit cache alone is named unconfirmed on the timeline too", () => {
+    const decision = {
+      stage: "code-generation",
+      unit: "PU-A-core",
+      checkpoint: "Construction Unit Approval",
+      since: "2026-01-01T03:00:00Z",
+    };
+    for (const lang of ["en", "ko"] as const) {
+      const t = strings(lang).timeline;
+      const loose = {
+        ...base,
+        waits: { ...base.waits, decision: { ...decision, scopeVerified: false } },
+      };
+      expect(renderBody(loose, lang)).toContain(t.awaitingDecisionUnscoped);
+      const firm = {
+        ...base,
+        waits: { ...base.waits, decision: { ...decision, scopeVerified: true } },
+      };
+      expect(renderBody(firm, lang)).not.toContain(t.awaitingDecisionUnscoped);
+    }
+  });
+
+  test("an unread team unit gate says so instead of 'nothing waiting'", () => {
+    const m = { ...base, waits: { ...base.waits, teamGateUnread: true } };
+    const en = renderBody(m, "en");
+    expect(en).toContain(EN.timeline.awaitingTeamUnread);
+    expect(en).not.toContain(EN.timeline.awaitingNone);
+    // With its scope, the row names the unit and stage it could not decide.
+    const at = { stage: "code-generation", unit: "PU-B-ui", scopeVerified: true };
+    const named = renderBody(
+      { ...base, waits: { ...base.waits, teamGateUnread: true, teamGateUnreadAt: at } },
+      "en",
+    );
+    expect(named).toContain(
+      `${esc(EN.status.humanTeamGateUnread)}<span class="mr-sub"> · PU-B-ui · code-generation</span>`,
+    );
+  });
+
+  test("an open team unit gate is named on the line and counted in the answers tab", () => {
+    const teamGate = {
+      stage: "code-generation",
+      unit: "PU-B-ui",
+      status: "awaiting-approval" as const,
+      scopeVerified: true,
+    };
+    const m = { ...base, blockers: [], waits: { ...base.waits, teamGate } };
+    // Counted like the stage gate: one more than the same page without it.
+    const answers = (html: string) =>
+      Number(
+        new RegExp(`${EN.cards.answersTab} <b class="mc-n [a-z]+">(\\d+)\\??</b>`).exec(html)?.[1],
+      );
+    const without = { ...base, blockers: [], waits: { ...base.waits, gate: undefined } };
+    const withGate = { ...m, waits: { ...m.waits, gate: undefined } };
+    const before = answers(renderBody(without, "en"));
+    expect(Number.isInteger(before)).toBe(true);
+    expect(answers(renderBody(withGate, "en"))).toBe(before + 1);
+    for (const lang of ["en", "ko"] as const) {
+      const t = strings(lang);
+      const html = renderBody(m, lang);
+      expect(html).toContain(t.timeline.awaitingTeam("PU-B-ui", "code-generation"));
+      expect(html).not.toContain(t.timeline.awaitingNone);
+      expect(html).toContain(esc(t.status.humanTeamGate("PU-B-ui", "code-generation")));
+    }
+    // Revising is shown, not counted, and the line does not call it pending.
+    const revising = {
+      ...base,
+      blockers: [],
+      waits: { ...base.waits, teamGate: { ...teamGate, status: "revising" as const } },
+    };
+    const en = renderBody(revising, "en");
+    expect(en).toContain(esc(EN.status.humanTeamGateRevising("PU-B-ui", "code-generation")));
+    expect(en).not.toContain(EN.timeline.awaitingTeam("PU-B-ui", "code-generation"));
+  });
+
+  test("with nothing read open, the line claims only the stage gate", () => {
+    const en = renderBody(base, "en");
+    expect(en).toContain(EN.timeline.awaitingNone);
+    expect(EN.timeline.awaitingNone).not.toContain("nothing is waiting");
+    expect(KO.timeline.awaitingNone).not.toContain("승인을 기다리는 stage 가 없다는 뜻");
+  });
+
+  test("the waits source note names every source the strip reads", () => {
+    for (const x of [EN.status, KO.status]) {
+      expect(x.humanSource).toContain("state");
+      expect(x.humanSource).not.toBe("questions files");
+    }
+  });
+
+  test("the unit-column note appears only beside a clone with no unit, and names the real cause", () => {
+    // The fixture's second clone has no row naming a unit.
+    const en = renderBody(base, "en");
+    expect(en).toContain(EN.timeline.unitColumnNote);
+    expect(EN.timeline.unitColumnNote).not.toContain("Output path");
+    expect(KO.timeline.unitColumnNote).not.toContain("Output path");
+    const all = {
+      ...base,
+      timing: {
+        ...base.timing,
+        workers: base.timing.workers.map((w) => ({
+          ...w,
+          units: w.units.length ? w.units : ["PU-A-core"],
+        })),
+      },
+    };
+    expect(renderBody(all, "en")).not.toContain(EN.timeline.unitColumnNote);
+  });
+});
+
+describe("degradation", () => {
+  test("a tree with no aidlc/ raises NoRunError", () => {
+    expect(() => assemble(path.join(import.meta.dir, "does-not-exist"))).toThrow(NoRunError);
+  });
+});
+
+// The 2.11 record keeps its bookkeeping under `.aidlc-engine/` — the reference fixture
+// is in that shape. The engine (2.11 `engineReadDirFor`) still reads two persistent
+// dirs through their pre-2.9 names when the new one is ABSENT; these tests pin that the
+// dashboard reads the same directory the engine does, nothing more.
+describe("2.11 record layout", () => {
+  const RECORD = "aidlc/spaces/default/intents/260101-demo-migration";
+
+  function copyFixture(): { dir: string; record: string } {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-engine-"));
+    fs.cpSync(path.join(FIXTURE, "aidlc"), path.join(dir, "aidlc"), { recursive: true });
+    fs.cpSync(path.join(FIXTURE, ".kiro"), path.join(dir, ".kiro"), { recursive: true });
+    return { dir, record: path.join(dir, RECORD) };
+  }
+
+  test("hooks, the stop guard and sensor bodies are read from .aidlc-engine/", () => {
+    const m = assemble(FIXTURE);
+    expect(m.health.hooks.length).toBe(7);
+    expect(m.health.stopGuard).toEqual({ signature: FIXTURE_GUARD, count: 1 });
+    expect(m.sensors.failuresWithoutBody).toBe(0);
+    expect(m.sensors.failures[0]?.errors.length).toBe(2);
+  });
+
+  test("a new engine dir wins over a stale legacy one, as the engine reads it", () => {
+    // `engineReadDirFor` revives legacy data only when the new entry is ABSENT.
+    const { dir, record } = copyFixture();
+    try {
+      const legacy = path.join(record, ".aidlc-hooks-health");
+      fs.mkdirSync(legacy);
+      fs.writeFileSync(path.join(legacy, "legacy-only.last"), "2026-02-01T00:00:00Z");
+      const m = assemble(dir);
+      expect(m.health.hooks.some((h) => h.name === "legacy-only")).toBe(false);
+      expect(m.health.hooks.length).toBe(7);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty new sensors dir does not revive legacy finding bodies", () => {
+    // Same rule for the second persistent dir: present-but-empty is not absent.
+    const { dir, record } = copyFixture();
+    try {
+      const engineSensors = path.join(record, ".aidlc-engine", "sensors");
+      fs.renameSync(engineSensors, path.join(record, ".aidlc-sensors"));
+      fs.mkdirSync(engineSensors);
+      const m = assemble(dir);
+      expect(m.sensors.totalFailed).toBe(1);
+      expect(m.sensors.failuresWithoutBody).toBe(1);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a hook's own marker file is not a hook", () => {
+    // `reviewer-scope.missing-record.last` rate-limits one advisory; read as a hook
+    // it adds a row that never fires and lends its stamp to the last-activity time.
+    const { dir, record } = copyFixture();
+    try {
+      const health = path.join(record, ".aidlc-engine", "hooks-health");
+      fs.writeFileSync(
+        path.join(health, "reviewer-scope.missing-record.last"),
+        "2099-01-01T00:00:00Z",
+      );
+      const m = assemble(dir);
+      expect(m.health.hooks.some((h) => h.name.includes("missing-record"))).toBe(false);
+      expect(m.health.hooks.length).toBe(7);
+      expect(m.health.lastActivity).not.toBe("2099-01-01T00:00:00Z");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a blank engine-held plan approval is a blocker", () => {
+    // `aidlc-plan-approval-ask.ts` writes this file shape; it carries no Q<n>, and
+    // reading only ids showed zero blockers over a run parked on it.
+    const { dir, record } = copyFixture();
+    try {
+      fs.writeFileSync(
+        path.join(record, "construction/PU-A-core/code-generation/code-generation-questions.md"),
+        [
+          "# Code Generation Plan Approval",
+          "",
+          "AI-DLC writes this file when it asks you to approve the plan. To answer here",
+          "instead of in chat, write your answer after `[Answer]:` and say done.",
+          "",
+          "## Plan Approval",
+          "",
+          "Approve the code plan for PU-A-core?",
+          "",
+          "- A. Approve Plan",
+          "- B. Request Changes",
+          "- C. I'll edit the files",
+          "",
+          "[Answer]:",
+          "",
+        ].join("\n"),
+      );
+      const m = assemble(dir);
+      const plan = m.blockers.find((b) => b.unit === "PU-A-core");
+      expect(plan?.heading).toBe("Plan Approval");
+      expect(plan?.kind).toBe("confirmation");
+      expect(m.blockers.length).toBe(2); // the fixture's own Q1 plus this one
+      // The picker card reads the same parser, and must say the same.
+      const summary = readWorkspaceSummary(dir);
+      expect(summary.kind === "ok" ? summary.blockers.count : -1).toBe(2);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a runtime-skipped per-unit stage ([S]) is a skip row in the matrix", () => {
+    // `[S] … — EXECUTE` still says EXECUTE, and the matrix used to scan it: every
+    // unit drew as absent with a provisional mark on a stage the run had skipped.
+    const { dir, record } = copyFixture();
+    try {
+      const statePath = path.join(record, "aidlc-state.md");
+      fs.writeFileSync(
+        statePath,
+        fs
+          .readFileSync(statePath, "utf-8")
+          .replace("- [-] code-generation — EXECUTE", "- [S] code-generation — EXECUTE"),
+      );
+      const m = assemble(dir);
+      const cg = m.matrix?.stages.find((st) => st.slug === "code-generation");
+      expect(cg?.status).toBe("skipped");
+      expect(cg?.execute).toBe(true); // what the state file says, kept
+      expect(cg?.cells).toEqual([]);
+      expect(cg?.provisional).toBe(false);
+      const row = /<tr class="mx-skip"><th>Code Generation<\/th>/;
+      expect(renderBody(m)).toMatch(row);
+      // The journey's unit row draws only stages that ran, so the skipped stage gets no
+      // column of absent cells; the board still lists it, struck through as skipped.
+      const html = renderJourney(m, strings("en"));
+      const units = html.slice(html.indexOf('class="jr-units"'));
+      expect(units).toContain("Functional Design");
+      expect(units).not.toContain("Code Generation");
+      expect(html).toContain('class="jr-s jk-skip"');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// The dashboard reads the `aidlc/` docs tree, which is byte-identical across
+// harnesses — so it must not care WHICH harness produced the run. These build
+// throwaway trees that rename the harness dir and assert the model is unchanged.
+describe("harness-agnostic", () => {
+  /** Copy the fixture into a temp dir, renaming its harness dir. */
+  function treeWithHarness(harness: string | null): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-dash-"));
+    fs.cpSync(path.join(FIXTURE, "aidlc"), path.join(dir, "aidlc"), { recursive: true });
+    if (harness) {
+      fs.cpSync(path.join(FIXTURE, ".kiro"), path.join(dir, harness), { recursive: true });
+    }
+    return dir;
+  }
+
+  const baseline = assemble(FIXTURE);
+
+  for (const harness of [".kiro", ".claude", ".aidlc", ".futureharness"]) {
+    test(`discovers the catalogue in ${harness} and reads identically`, () => {
+      const dir = treeWithHarness(harness);
+      try {
+        const m = assemble(dir);
+        expect(m.identity.harnessDir).toBe(harness);
+        expect(m.warnings).toEqual([]);
+        // The verdicts that DEPEND on the catalogue must match the baseline.
+        expect(m.matrix?.contractAware).toBe(true);
+        const cg = m.matrix?.stages.find((s) => s.slug === "code-generation")!;
+        expect([cg.complete, cg.partial]).toEqual([1, 1]);
+        expect(m.blockers.length).toBe(baseline.blockers.length);
+        expect(m.totalEvents).toBe(baseline.totalEvents);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("`.claude` wins the probe order when several harness dirs coexist", () => {
+    const dir = treeWithHarness(".kiro");
+    try {
+      fs.cpSync(path.join(FIXTURE, ".kiro"), path.join(dir, ".claude"), { recursive: true });
+      expect(assemble(dir).identity.harnessDir).toBe(".claude");
+      // ...and --harness overrides that choice.
+      expect(assemble(dir, ".kiro").identity.harnessDir).toBe(".kiro");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("aidlc/ ALONE still reports everything except the artifact contract", () => {
+    const dir = treeWithHarness(null);
+    try {
+      const m = assemble(dir);
+      expect(m.identity.harnessDir).toBeUndefined();
+      // Everything not derived from the catalogue is unaffected.
+      expect(m.state.overallPct).toBe(baseline.state.overallPct);
+      expect(m.totalEvents).toBe(baseline.totalEvents);
+      expect(m.blockers.length).toBe(baseline.blockers.length);
+      expect(m.sensors.totalFailed).toBe(baseline.sensors.totalFailed);
+      expect(m.timing.stages.length).toBe(baseline.timing.stages.length);
+      // The contract-dependent parts degrade LOUDLY, not silently.
+      expect(m.matrix?.contractAware).toBe(false);
+      expect(codes(m)).toEqual(["catalog-not-found"]);
+      // And the code still becomes the same sentence on screen — the render path is
+      // what the restructure could have broken silently.
+      expect(renderBody(m, "ko")).toContain("stage 카탈로그 미검출");
+      expect(m.provenance["stage-graph"].stale).toBe(true);
+      // And the page says so rather than showing a confident matrix.
+      expect(renderBody(m, "ko")).toContain("계약 판정 불가");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("findHarnessDir returns undefined when no dir carries a catalogue", () => {
+    const dir = treeWithHarness(null);
+    try {
+      fs.mkdirSync(path.join(dir, ".kiro", "tools"), { recursive: true }); // present but empty
+      expect(findHarnessDir(dir)).toBeUndefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("cli", () => {
+  test("accepts a valid root and applies defaults", () => {
+    const o = parseArgs(["--root", FIXTURE]);
+    expect(o.port).toBe(4321);
+    expect(o.pollMs).toBe(60_000); // unified 1-minute screen poll (BR4.1)
+    expect(o.intervalMs).toBe(300_000);
+    expect(path.isAbsolute(o.root!)).toBe(true);
+  });
+
+  test("overrides port, browser poll, and collection interval", () => {
+    const o = parseArgs([
+      "--root",
+      FIXTURE,
+      "--port",
+      "9999",
+      "--poll",
+      "0",
+      "--interval",
+      "15000",
+    ]);
+    expect(o.port).toBe(9999);
+    expect(o.pollMs).toBe(0);
+    expect(o.intervalMs).toBe(15_000);
+  });
+
+  test("port/interval come from env, and an explicit flag wins", () => {
+    const env = {
+      AIDLC_DASHBOARD_PORT: "5000",
+      AIDLC_DASHBOARD_INTERVAL_MS: "45000",
+    };
+    expect(parseArgs([], env)).toMatchObject({ port: 5000, intervalMs: 45_000 });
+    expect(parseArgs(["--port", "6000", "--interval", "90000"], env)).toMatchObject({
+      port: 6000,
+      intervalMs: 90_000,
+    });
+  });
+
+  test("an invalid env value falls back to the default, and --interval 0 is refused", () => {
+    const env = {
+      AIDLC_DASHBOARD_PORT: "nope",
+      AIDLC_DASHBOARD_INTERVAL_MS: "0",
+    };
+    expect(parseArgs([], env)).toMatchObject({ port: 4321, intervalMs: 300_000 });
+    expect(() => parseArgs(["--interval", "0"], {})).toThrow(UsageError);
+  });
+
+  test("reads the launch dir from the launcher's env and drops a bad one", () => {
+    const here = import.meta.dir;
+    expect(parseArgs([], { AIDLC_DASHBOARD_LAUNCH_DIR: here }).launchDir).toBe(here);
+    expect(parseArgs(["--root", FIXTURE], { AIDLC_DASHBOARD_LAUNCH_DIR: here }).launchDir).toBe(
+      here,
+    );
+    // A hint, so a bad value is dropped rather than refusing to start.
+    expect(parseArgs([], {}).launchDir).toBeUndefined();
+    expect(parseArgs([], { AIDLC_DASHBOARD_LAUNCH_DIR: "/nope/nope" }).launchDir).toBeUndefined();
+    expect(parseArgs([], { AIDLC_DASHBOARD_LAUNCH_DIR: "relative/dir" }).launchDir).toBeUndefined();
+  });
+
+  test("rejects a bad path and a non-workspace when --root IS given", () => {
+    expect(() => parseArgs(["--root", "/nope/nope"])).toThrow(UsageError);
+    // A real dir that holds no aidlc/ tree.
+    expect(() => parseArgs(["--root", import.meta.dir])).toThrow(UsageError);
+  });
+
+  test("rejects a non-numeric port and unknown flags", () => {
+    expect(() => parseArgs(["--root", FIXTURE, "--port", "abc"])).toThrow(UsageError);
+    expect(() => parseArgs(["--root", FIXTURE, "--bogus"])).toThrow(UsageError);
+  });
+
+  test("--lang sets the DEFAULT language and rejects anything outside ko|en", () => {
+    // Default, not the language: a reader's ?lang= / cookie / Accept-Language wins.
+    expect(parseArgs(["--root", FIXTURE]).locale).toBe("en");
+    expect(parseArgs(["--root", FIXTURE, "--lang", "ko"]).locale).toBe("ko");
+    // Regional tags are not locales here — the split is Korean / non-Korean.
+    expect(() => parseArgs(["--root", FIXTURE, "--lang", "en-GB"])).toThrow(UsageError);
+    expect(() => parseArgs(["--root", FIXTURE, "--lang", "ja"])).toThrow(UsageError);
+    expect(() => parseArgs(["--root", FIXTURE, "--lang"])).toThrow(UsageError);
+  });
+
+  test("--harness is optional, accepted when real, rejected when absent", () => {
+    expect(parseArgs(["--root", FIXTURE]).harnessDir).toBeUndefined();
+    expect(parseArgs(["--root", FIXTURE, "--harness", ".kiro"]).harnessDir).toBe(".kiro");
+    expect(() => parseArgs(["--root", FIXTURE, "--harness", ".nope"])).toThrow(UsageError);
+  });
+
+  test("a harness dir is NOT required — only aidlc/ is", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-cli-"));
+    try {
+      fs.mkdirSync(path.join(dir, "aidlc"));
+      expect(parseArgs(["--root", dir]).root).toBe(dir);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("--root is OPTIONAL — omitting it starts the picker instead of failing", () => {
+    const o = parseArgs([]);
+    expect(o.root).toBeUndefined();
+    expect(o.port).toBe(4321);
+  });
+
+  test("expands a leading ~ (the picker's text field bypasses the shell)", () => {
+    expect(expandHome("~")).toBe(os.homedir());
+    expect(expandHome("~/Documents")).toBe(path.join(os.homedir(), "Documents"));
+    expect(expandHome("/abs/path")).toBe(path.resolve("/abs/path")); // C:\abs\path on Windows
+    expect(expandHome("  ~/x  ")).toBe(path.join(os.homedir(), "x")); // trims
+    if (process.platform === "win32") {
+      expect(expandHome("~\\Documents")).toBe(path.join(os.homedir(), "Documents"));
+    }
+  });
+});
+
+// The workspace picker combines direct entry, bounded discovery, and a
+// cross-platform server-side directory explorer.
+describe("folder picker", () => {
+  test("flags the workspace among sibling dirs and sorts it first", () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-pick-"));
+    try {
+      fs.mkdirSync(path.join(parent, "zzz-plain"));
+      fs.mkdirSync(path.join(parent, "aaa-plain"));
+      const ws = path.join(parent, "mmm-workspace");
+      fs.mkdirSync(path.join(ws, "aidlc", "spaces"), { recursive: true });
+      // Named aidlc, holding no spaces/: a skill or a project folder, not a workspace.
+      fs.mkdirSync(path.join(parent, "skills", "aidlc"), { recursive: true });
+      fs.mkdirSync(path.join(parent, "zzz-plain", "aidlc"), { recursive: true });
+
+      const b = browse(parent);
+      expect(b.dir).toBe(parent);
+      expect(b.entries[0]?.name).toBe("mmm-workspace"); // workspaces first
+      expect(b.entries[0]?.isWorkspace).toBe(true);
+      expect(b.entries.filter((e) => e.isWorkspace).length).toBe(1);
+      // ...and the rest keep alphabetical order.
+      expect(b.entries.slice(1).map((e) => e.name)).toEqual(["aaa-plain", "skills", "zzz-plain"]);
+      expect(b.isWorkspace).toBe(false); // the parent itself is not one
+      // The aidlc/ folder of a non-workspace is no tree to open either.
+      expect(browse(path.join(parent, "skills")).entries[0]?.isAidlcDir).toBe(false);
+      expect(browse(ws).entries.find((e) => e.name === "aidlc")?.isAidlcDir).toBe(true);
+      expect(resolveWorkspace(path.join(parent, "skills"))).toBeUndefined();
+      expect(resolveWorkspace(path.join(parent, "skills", "aidlc"))).toBeUndefined();
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("hides dot-dirs unless asked", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-pick-"));
+    try {
+      fs.mkdirSync(path.join(dir, ".kiro"));
+      fs.mkdirSync(path.join(dir, "visible"));
+      expect(browse(dir).entries.map((e) => e.name)).toEqual(["visible"]);
+      expect(browse(dir, true).entries.map((e) => e.name)).toEqual([".kiro", "visible"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an unreadable path falls back to home and reports the error", () => {
+    const b = browse("/definitely/not/a/real/path");
+    // The scan layer names the FAILURE (dir + OS message); the sentence around it is
+    // render's (`explorer.browseFailed`), which is why this is not a `.error` string.
+    expect(b.browseFailure).toMatchObject({ dir: path.resolve("/definitely/not/a/real/path") });
+    expect(b.browseFailure?.message.length).toBeGreaterThan(0);
+    expect(b.dir).toBe(os.homedir()); // still renders something usable
+  });
+
+  test("the filesystem root has no parent link", () => {
+    expect(browse("/").parent).toBeUndefined();
+  });
+
+  test("resolveWorkspace accepts the workspace OR its aidlc/ dir", () => {
+    expect(resolveWorkspace(FIXTURE)).toBe(path.resolve(FIXTURE));
+    // Picking the aidlc/ folder itself is the obvious mistake — accept it.
+    expect(resolveWorkspace(path.join(FIXTURE, "aidlc"))).toBe(path.resolve(FIXTURE));
+  });
+
+  test("resolveWorkspace rejects a non-workspace", () => {
+    expect(resolveWorkspace(os.tmpdir())).toBeUndefined();
+    expect(resolveWorkspace("/definitely/not/real")).toBeUndefined();
+  });
+
+  test("renders the picker with select links and escapes names", () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-pick-"));
+    try {
+      // `<` cannot be in a Windows file name; `&` can, and still needs escaping there.
+      const [name, escaped] =
+        process.platform === "win32"
+          ? ["we&ird name", "we&amp;ird name"]
+          : ["we<ird&name", "we&lt;ird&amp;name"];
+      const hostile = path.join(parent, name);
+      fs.mkdirSync(path.join(hostile, "aidlc", "spaces"), { recursive: true });
+      const html = renderPicker(browse(parent), false);
+      expect(html.startsWith("<!DOCTYPE html>")).toBe(true);
+      expect(html).toContain("/select?dir=");
+      expect(html).not.toContain(name); // raw form must not survive
+      expect(html).toContain(escaped);
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("one path field opens and navigates: no separate path form or open-this-folder button", () => {
+    // The field submits to /select, which opens a workspace and redirects any other folder to
+    // /browse — so the listed folder needs no button of its own, workspace or not.
+    for (const dir of [FIXTURE, path.dirname(FIXTURE)]) {
+      const html = renderPicker(browse(dir), false);
+      expect(html.match(/<form /g)?.length).toBe(1);
+      expect(html).toContain('<form class="path-bar" action="/select" method="get">');
+      expect(html).toContain('id="path-input" name="dir"');
+      expect(html).not.toContain("이 폴더 열기");
+      expect(html).not.toContain('id="manual-dir"');
+      expect(html).not.toContain('id="directory-filter"');
+    }
+  });
+
+  test("leads with the found workspaces and folds the browser and the path form under them", () => {
+    const html = renderPicker(
+      browse(FIXTURE),
+      false,
+      undefined,
+      {
+        workspaces: [{ name: "reference", path: FIXTURE }],
+        searchedRoots: [path.dirname(FIXTURE)],
+        scannedDirectories: 12,
+        truncated: false,
+      },
+      undefined,
+      "ko",
+    );
+
+    expect(html).toContain("1곳 · 폴더 12개 확인");
+    expect(html).toContain(`href="/select?dir=${encodeURIComponent(FIXTURE)}"`);
+    expect(html.indexOf("찾은 워크스페이스")).toBeLessThan(html.indexOf('id="path-input"'));
+    // Closed while the list can answer.
+    expect(html).toContain('<details class="other-locations" id="other-locations">');
+    expect(html).toContain('aria-label="탐색 루트"');
+    expect(html).toContain('aria-label="현재 경로"');
+    expect(html).toContain('id="path-input"');
+    expect(html).toContain('id="workspace-filter"');
+    expect(html).toContain('class="directory-viewport"');
+  });
+
+  test("marks a workspace found where the command was launched", () => {
+    const disc = (nearLaunch: boolean) => ({
+      workspaces: [{ name: "reference", path: FIXTURE, nearLaunch }],
+      searchedRoots: [path.dirname(FIXTURE)],
+      scannedDirectories: 1,
+      truncated: false,
+    });
+    expect(renderPicker(browse(FIXTURE), false, undefined, disc(true), undefined, "ko")).toContain(
+      '<span class="launch-mark">실행한 폴더에서 찾음</span>',
+    );
+    expect(
+      renderPicker(browse(FIXTURE), false, undefined, disc(false), undefined, "ko"),
+    ).not.toContain('<span class="launch-mark">');
+  });
+
+  test("prefills the path field with the folder on screen, home-relative, ending in a separator", () => {
+    const parent = path.dirname(FIXTURE);
+    const html = renderPicker(browse(parent), false, undefined, undefined, undefined, "ko", {
+      home: path.dirname(parent),
+    });
+    const shown = `~/${path.basename(parent)}/`;
+    expect(html).toContain(`value="${shown}"`);
+    expect(html).toContain(`data-base="${shown}"`);
+    expect(html).toContain(`data-abs="${parent}/"`);
+  });
+
+  test("escapes explorer roots and breadcrumbs and ships local directory filtering", () => {
+    const html = renderPicker(browse(FIXTURE), false, undefined, undefined, {
+      roots: [
+        {
+          label: { key: "raw", name: 'bad"><root' },
+          path: '/tmp/a&b"',
+          kind: "volume",
+          active: true,
+        },
+      ],
+      breadcrumbs: [
+        { label: "/", path: "/", current: false },
+        { label: "<project>", path: "/<project>", current: true },
+      ],
+    });
+
+    expect(html).toContain("bad&quot;&gt;&lt;root");
+    expect(html).toContain("&lt;project&gt;");
+    expect(html).not.toContain('bad"><root');
+    expect(html).toContain('row.dataset.dirName || ""');
+    expect(html).toContain('event.key === "Escape"');
+    expect(html).toContain('id="path-status"');
+  });
+
+  test("spins the rescan icon while workspace discovery is running", () => {
+    const html = renderPicker(browse(FIXTURE), false);
+
+    expect(html).toContain('id="rescan-link"');
+    expect(html).toContain("@keyframes picker-rescan-spin");
+    expect(html).toContain('rescan.classList.add("scanning")');
+    expect(html).toContain('rescan.setAttribute("aria-busy", "true")');
+    expect(html).toContain("@media (prefers-reduced-motion:reduce)");
+  });
+});
+
+// The reload control. A change the poll cannot anticipate — a stage flipped
+// between SKIP and EXECUTE, a hand-edited state file — must be observable on
+// demand, so the page ships a button and the server re-reads on every request.
+describe("manual reload", () => {
+  test("the page renders a reload button and a single refresh path", () => {
+    const html = renderPage(assemble(FIXTURE), 10_000);
+    expect(html).toContain('id="reload-btn"');
+    expect(html).toContain("function refresh");
+    expect(html).toContain("fetch('/api/refresh'");
+    expect(html.match(/id="reload-btn"/g)).toHaveLength(1);
+    expect(html).toContain("@keyframes reload-spin");
+    expect(html).toContain('class="reload-icon"');
+    expect(html).toContain("btn.setAttribute('aria-busy', 'true')");
+    // Button, timer and tab-focus must all route through the same function so
+    // they cannot drift apart.
+    expect(html).toContain("refresh(true)");
+    expect(html).toContain("refresh(false)");
+    expect(html).toContain("visibilitychange");
+  });
+
+  test("the reload button survives --poll 0 (auto-refresh off)", () => {
+    const html = renderPage(assemble(FIXTURE), 0);
+    expect(html).toContain('id="reload-btn"');
+    expect(html).toContain("function refresh");
+    expect(html).not.toContain("setInterval");
+  });
+
+  test("re-assembling picks up a SKIP→EXECUTE edit made after the first read", () => {
+    // This is the reported symptom, reproduced at the model layer: flipping the
+    // scope marker changes the DENOMINATOR, so a stale page shows a stale %.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-skip-"));
+    try {
+      fs.cpSync(path.join(FIXTURE, "aidlc"), path.join(dir, "aidlc"), { recursive: true });
+      fs.cpSync(path.join(FIXTURE, ".kiro"), path.join(dir, ".kiro"), { recursive: true });
+      const statePath = path.join(
+        dir,
+        "aidlc/spaces/default/intents/260101-demo-migration/aidlc-state.md",
+      );
+
+      const before = assemble(dir);
+      expect(before.state.overallTotal).toBe(5);
+      expect(before.state.overallPct).toBe(80);
+
+      fs.writeFileSync(
+        statePath,
+        fs
+          .readFileSync(statePath, "utf-8")
+          .replace("- [ ] infrastructure-design — SKIP", "- [ ] infrastructure-design — EXECUTE"),
+      );
+
+      // No caching anywhere, so the very next assemble reflects the edit.
+      const after = assemble(dir);
+      expect(after.state.overallTotal).toBe(6); // denominator grew
+      expect(after.state.overallDone).toBe(4); // numerator unchanged
+      expect(after.state.overallPct).toBe(67);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a runtime-skipped stage ([S]) leaves the denominator like a scope SKIP does", () => {
+    // Measured on a real run: `[S] market-research — EXECUTE` stayed in the
+    // denominator forever, so overall read 80% and the Ideation phase read 86%
+    // while state.md declared that phase Verified. A run that skips a stage at
+    // runtime could never reach 100%.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-sskip-"));
+    try {
+      fs.cpSync(path.join(FIXTURE, "aidlc"), path.join(dir, "aidlc"), { recursive: true });
+      fs.cpSync(path.join(FIXTURE, ".kiro"), path.join(dir, ".kiro"), { recursive: true });
+      const statePath = path.join(
+        dir,
+        "aidlc/spaces/default/intents/260101-demo-migration/aidlc-state.md",
+      );
+      const before = assemble(dir);
+      expect(before.state.overallTotal).toBe(5);
+
+      // The fixture's only outstanding stage is `[-] code-generation` (in flight).
+      // Turn it into a runtime skip: it must leave the denominator, which is what
+      // lets a run whose remaining stages were all skipped read as complete.
+      fs.writeFileSync(
+        statePath,
+        fs
+          .readFileSync(statePath, "utf-8")
+          .replace("- [-] code-generation — EXECUTE", "- [S] code-generation — EXECUTE"),
+      );
+      const after = assemble(dir);
+      expect(after.state.overallTotal).toBe(4); // denominator shrank
+      expect(after.state.overallDone).toBe(4); // numerator unchanged
+      expect(after.state.overallPct).toBe(100);
+      const construction = after.state.phases.find((p) => p.key === "construction")!;
+      expect(construction.stages.find((s) => s.slug === "code-generation")?.status).toBe("skipped");
+      // Construction keeps functional-design; the scope-SKIP and the runtime-skip
+      // both drop out, so the phase reads 1/1 instead of 1/2.
+      expect(construction.total).toBe(1);
+      expect(construction.pct).toBe(100);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// The artifact listing + the open endpoint's path jail. The jail is the reason
+// these tests exist: `rel` arrives from the page, so a regression that lets it
+// escape the record dir would turn a dashboard click into arbitrary-file-open.
+describe("stage artifacts", () => {
+  function stageTree(): { root: string; record: string } {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-art-"));
+    const record = path.join(root, "record");
+    const dir = path.join(record, "ideation", "intent-capture");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "intent-statement.md"), "x".repeat(10));
+    fs.writeFileSync(path.join(dir, "stakeholder-map.md"), "y");
+    fs.writeFileSync(path.join(dir, "intent-capture-questions.md"), "q");
+    fs.writeFileSync(path.join(dir, "memory.md"), "d");
+    fs.writeFileSync(path.join(dir, "notes.txt"), "ignored"); // not a listed ext
+    fs.writeFileSync(path.join(dir, "state.last"), "ignored"); // engine bookkeeping
+    fs.mkdirSync(path.join(dir, "subdir")); // not a file
+    return { root, record };
+  }
+
+  test("lists md + html + json, classifies kinds, and orders deliverables first", () => {
+    const { root, record } = stageTree();
+    try {
+      // html is a real deliverable (the visual-mockups plugin's HTML path), so a
+      // markdown-only filter would hide what the mockup stages exist to produce.
+      fs.writeFileSync(
+        path.join(record, "ideation", "intent-capture", "a-mockup.html"),
+        "<html></html>",
+      );
+      // So is json: `traceability` is contracted by 8 stages and always written as
+      // `traceability.json`, so an md+html filter hid a contract deliverable.
+      fs.writeFileSync(path.join(record, "ideation", "intent-capture", "traceability.json"), "{}");
+      const got = listStageArtifacts(record, "ideation", "intent-capture");
+      expect(got.map((a) => a.name)).toEqual([
+        "a-mockup.html",
+        "intent-statement.md",
+        "stakeholder-map.md",
+        "traceability.json",
+        "intent-capture-questions.md",
+        "memory.md",
+      ]);
+      expect(got.map((a) => a.kind)).toEqual([
+        "artifact",
+        "artifact",
+        "artifact",
+        "artifact",
+        "questions",
+        "diary",
+      ]);
+      expect(got.some((a) => a.name.endsWith(".txt") || a.name.endsWith(".last"))).toBe(false);
+      const statement = got.find((a) => a.name === "intent-statement.md")!;
+      expect(statement.rel).toBe("ideation/intent-capture/intent-statement.md");
+      expect(statement.size).toBe(10);
+      expect(statement.unit).toBeUndefined();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an absent stage dir is an empty list, not a throw", () => {
+    const { root, record } = stageTree();
+    try {
+      expect(listStageArtifacts(record, "operation", "never-ran")).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a per-unit stage carries its unit and the construction path", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-art-"));
+    try {
+      const dir = path.join(root, "construction", "PU-1-skeleton", "code-generation");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "code-summary.md"), "s");
+      const got = listStageArtifacts(root, "construction", "code-generation", "PU-1-skeleton");
+      expect(got).toHaveLength(1);
+      expect(got[0]?.unit).toBe("PU-1-skeleton");
+      expect(got[0]?.rel).toBe("construction/PU-1-skeleton/code-generation/code-summary.md");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // openArtifact spawns the OS opener on success, so only the REJECTION paths are
+  // asserted here — every one of them returns before any spawn.
+  test("the open jail rejects traversal, absolute paths, and bad extensions", () => {
+    const { root, record } = stageTree();
+    try {
+      expect(openArtifact(record, "../../../../etc/passwd", KO).ok).toBe(false);
+      expect(openArtifact(record, "/etc/passwd", KO)).toMatchObject({ ok: false, status: 403 });
+      expect(openArtifact(record, "ideation/intent-capture/notes.txt", KO)).toMatchObject({
+        ok: false,
+        status: 403,
+      });
+      expect(openArtifact(record, "ideation/intent-capture/state.last", KO)).toMatchObject({
+        ok: false,
+        status: 403,
+      });
+      expect(openArtifact(record, "ideation/intent-capture/absent.md", KO)).toMatchObject({
+        ok: false,
+        status: 404,
+      });
+      expect(openArtifact(record, "ideation/intent-capture/subdir", KO)).toMatchObject({
+        ok: false,
+        status: 403,
+      });
+      expect(openArtifact(record, "", KO)).toMatchObject({ ok: false, status: 400 });
+      expect(openArtifact(record, "a\0b.md", KO)).toMatchObject({ ok: false, status: 400 });
+      // A sibling dir sharing the record's prefix must not pass as inside it.
+      fs.mkdirSync(path.join(root, "record-evil"));
+      fs.writeFileSync(path.join(root, "record-evil", "x.md"), "z");
+      expect(openArtifact(record, "../record-evil/x.md", KO)).toMatchObject({
+        ok: false,
+        status: 403,
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a symlink pointing outside the record is refused", () => {
+    const { root, record } = stageTree();
+    try {
+      const outside = path.join(root, "outside.md");
+      fs.writeFileSync(outside, "secret");
+      const link = path.join(record, "ideation", "intent-capture", "link.md");
+      fs.symlinkSync(outside, link);
+      expect(openArtifact(record, "ideation/intent-capture/link.md", KO)).toMatchObject({
+        ok: false,
+        status: 403,
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // `/view` reads through the SAME jail as `/open` (resolveArtifact), so these assert the
+  // wiring rather than re-deriving the path rules: a reader that skipped the jail would
+  // pass every case below.
+  test("the view reader is jailed exactly as the opener is", () => {
+    const { root, record } = stageTree();
+    try {
+      expect(readArtifactSource(record, "../../../../etc/passwd").ok).toBe(false);
+      expect(readArtifactSource(record, "/etc/passwd")).toMatchObject({ ok: false, status: 403 });
+      expect(readArtifactSource(record, "ideation/intent-capture/notes.txt")).toMatchObject({
+        ok: false,
+        status: 403,
+      });
+      expect(readArtifactSource(record, "ideation/intent-capture/absent.md")).toMatchObject({
+        ok: false,
+        status: 404,
+      });
+      expect(readArtifactSource(record, "")).toMatchObject({ ok: false, status: 400 });
+      expect(readArtifactSource(record, "a\0b.md")).toMatchObject({ ok: false, status: 400 });
+      const outside = path.join(root, "outside.md");
+      fs.writeFileSync(outside, "secret");
+      fs.symlinkSync(outside, path.join(record, "ideation", "intent-capture", "link.md"));
+      expect(readArtifactSource(record, "ideation/intent-capture/link.md")).toMatchObject({
+        ok: false,
+        status: 403,
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the view reader returns source text, and does NOT refuse html", () => {
+    const { root, record } = stageTree();
+    try {
+      const dir = path.join(record, "ideation", "intent-capture");
+      fs.writeFileSync(path.join(dir, "a-mockup.html"), "<script>alert(1)</script>");
+      const md = readArtifactSource(record, "ideation/intent-capture/stakeholder-map.md");
+      expect(md).toMatchObject({ ok: true });
+      if (md.ok) {
+        expect(md.source.text).toBe("y");
+        expect(md.source.truncated).toBe(false);
+        expect(md.source.sizeBytes).toBe(1);
+      }
+      // Escaping happens in the renderer, so the READER hands back the file verbatim —
+      // refusing html here was answering a threat `esc()` had already removed.
+      const htmlSrc = readArtifactSource(record, "ideation/intent-capture/a-mockup.html");
+      expect(htmlSrc).toMatchObject({ ok: true });
+      if (htmlSrc.ok) expect(htmlSrc.source.text).toContain("<script>");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a file over the cap is truncated at a line boundary and says so", () => {
+    const { root, record } = stageTree();
+    try {
+      const dir = path.join(record, "ideation", "intent-capture");
+      const line = `${"z".repeat(99)}\n`; // 100 bytes each
+      const big = line.repeat(Math.ceil(MAX_VIEW_BYTES / 100) + 50);
+      fs.writeFileSync(path.join(dir, "big.md"), big);
+      const got = readArtifactSource(record, "ideation/intent-capture/big.md");
+      expect(got).toMatchObject({ ok: true });
+      if (!got.ok) return;
+      expect(got.source.truncated).toBe(true);
+      expect(got.source.sizeBytes).toBe(big.length);
+      expect(got.source.shownBytes).toBe(MAX_VIEW_BYTES);
+      // Cut back to the last newline: the final visible line is whole, so the page does
+      // not end on a byte-sliced character that reads as corruption in the file.
+      expect(got.source.text.endsWith("z")).toBe(true);
+      expect(got.source.text.length).toBeLessThan(MAX_VIEW_BYTES);
+      expect(got.source.text.split("\n").every((l) => l.length === 0 || l.length === 99)).toBe(
+        true,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty artifact reads as empty text, not as a failure", () => {
+    const { root, record } = stageTree();
+    try {
+      fs.writeFileSync(path.join(record, "ideation", "intent-capture", "empty.md"), "");
+      const got = readArtifactSource(record, "ideation/intent-capture/empty.md");
+      expect(got).toMatchObject({ ok: true });
+      if (got.ok) {
+        expect(got.source.text).toBe("");
+        expect(got.source.truncated).toBe(false);
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the reference fixture assembles an artifact index keyed by phase/slug", () => {
+    const m = assemble(FIXTURE);
+    expect(Object.keys(m.artifacts).length).toBeGreaterThan(0);
+    // Every key is <phase>/<slug> or construction/<unit>/<slug>, and every entry
+    // is a rel path that starts with its key's first segment.
+    for (const [key, files] of Object.entries(m.artifacts)) {
+      expect(key.split("/").length).toBeGreaterThanOrEqual(2);
+      for (const f of files) expect(f.rel.endsWith(f.name)).toBe(true);
+    }
+    expect(path.isAbsolute(m.identity.recordDir)).toBe(true);
+  });
+});
+
+// The docs tree is harness-neutral, but usage is NOT: Kiro exposes a remote
+// credit quota while Claude Code leaves local token counts in its transcripts. So
+// exactly one panel renders, chosen during assembly. These tests pin that choice —
+// the auto rule, the override, and the coexistence case where probe order would
+// otherwise decide silently.
+describe("usage panel selection", () => {
+  /** Fixture copy whose harness dirs are named by the caller. */
+  function treeWith(...harnesses: string[]): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-usage-"));
+    fs.cpSync(path.join(FIXTURE, "aidlc"), path.join(dir, "aidlc"), { recursive: true });
+    for (const h of harnesses) {
+      fs.cpSync(path.join(FIXTURE, ".kiro"), path.join(dir, h), { recursive: true });
+    }
+    return dir;
+  }
+
+  /** A home dir holding one synthetic Claude transcript for `root`. */
+  function homeWithTranscript(root: string, outputTokens: number): string {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-home-"));
+    const dir = path.join(home, ".claude", "projects", projectSlug(root));
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "s.jsonl"),
+      `${JSON.stringify({
+        type: "assistant",
+        timestamp: new Date().toISOString(),
+        sessionId: "s1",
+        cwd: root,
+        message: {
+          model: "claude-opus-5",
+          usage: { input_tokens: 5, output_tokens: outputTokens },
+        },
+      })}\n`,
+    );
+    return home;
+  }
+
+  test("auto + `.kiro` → the credit panel", () => {
+    expect(assemble(FIXTURE).usage.kind).toBe("kiro");
+  });
+
+  test("auto + `.claude` → the token panel", () => {
+    const dir = treeWith(".claude");
+    try {
+      const m = assemble(dir, undefined, { window: "30d" });
+      expect(m.usage.kind).toBe("claude");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("auto + no harness dir at all → the credit panel (its own empty view)", () => {
+    const dir = treeWith();
+    try {
+      const m = assemble(dir, undefined, { window: "30d" });
+      expect(m.usage.kind).toBe("kiro");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("--usage overrides the harness in both directions", () => {
+    expect(assemble(FIXTURE, undefined, { window: "30d", mode: "claude" }).usage.kind).toBe(
+      "claude",
+    );
+    const dir = treeWith(".claude");
+    try {
+      expect(assemble(dir, undefined, { window: "30d", mode: "kiro" }).usage.kind).toBe("kiro");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("coexisting harness dirs warn that probe order made the choice", () => {
+    const dir = treeWith(".kiro", ".claude");
+    try {
+      const m = assemble(dir, undefined, { window: "30d" });
+      // `.claude` wins the probe, so the token panel is what renders...
+      expect(m.usage.kind).toBe("claude");
+      // ...and that is stated, naming both dirs and the flag that overrides it.
+      const warning = m.warnings.find((w) => w.code === "harness-coexist");
+      expect(warning).toBeDefined();
+      // The dirs and the chosen panel are FACTS now; the sentence that names the
+      // overriding flag is warnings.ts's business and is asserted there.
+      expect(warning).toMatchObject({ chosen: "claude" });
+      expect(warning?.code === "harness-coexist" && warning.harnesses).toEqual([
+        ".claude",
+        ".kiro",
+      ]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an explicit --usage does NOT warn about coexistence (the choice was made)", () => {
+    const dir = treeWith(".kiro", ".claude");
+    try {
+      const m = assemble(dir, undefined, { window: "30d", mode: "claude" });
+      expect(codes(m)).not.toContain("harness-coexist");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the token panel reads the workspace's own transcripts and renders them", () => {
+    const dir = treeWith(".claude");
+    const home = homeWithTranscript(dir, 4242);
+    try {
+      const m = assemble(dir, undefined, { window: "30d", home });
+      if (m.usage.kind !== "claude") throw new Error("expected the token panel");
+      expect(m.usage.tokens.totals.output).toBe(4242);
+      expect(m.usage.tokens.sessions).toBe(1);
+      expect(m.usage.tokens.status).toBe("ok");
+      // ...and it reaches the page instead of the credit card.
+      const body = renderBody(m, "ko");
+      expect(body).toContain("토큰 사용량");
+      expect(body).toContain("4,242");
+      expect(body).not.toContain("플랜 한도");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("no transcripts for the workspace → none + the path it tried, not a crash", () => {
+    const dir = treeWith(".claude");
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-home-"));
+    try {
+      const m = assemble(dir, undefined, { window: "30d", home });
+      if (m.usage.kind !== "claude") throw new Error("expected the token panel");
+      expect(m.usage.tokens.status).toBe("none");
+      expect(m.usage.tokens.dir).toBeNull();
+      // The note is a code plus its facts now, so the path is a FIELD rather than a
+      // substring of a Korean sentence — see the TokenNote doc in token-model.ts.
+      const note = m.usage.tokens.notes.find((n) => n.code === "no-transcripts");
+      expect(note?.code === "no-transcripts" && note.triedPath).toContain(projectSlug(dir));
+      // The rest of the model is untouched by an empty usage panel.
+      expect(m.state.overallPct).toBe(80);
+      expect(m.totalEvents).toBeGreaterThan(0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+// The usage kind must follow the harness that was ASKED FOR, not the one the
+// catalogue managed to report. A broken stage-graph.json leaves no catalogue, and
+// reading the kind off it would silently show a Kiro credit panel for a Claude run.
+describe("usage kind survives a broken catalogue", () => {
+  function treeWithBrokenCatalog(harness: string): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aidlc-broken-"));
+    fs.cpSync(path.join(FIXTURE, "aidlc"), path.join(dir, "aidlc"), { recursive: true });
+    const data = path.join(dir, harness, "tools", "data");
+    fs.mkdirSync(data, { recursive: true });
+    fs.writeFileSync(path.join(data, "stage-graph.json"), "{ this is not json");
+    return dir;
+  }
+
+  test("--harness .claude + unparseable catalogue → still the token panel", () => {
+    const dir = treeWithBrokenCatalog(".claude");
+    try {
+      const m = assemble(dir, ".claude", { window: "30d" });
+      expect(m.identity.harnessDir).toBeUndefined(); // the catalogue really did fail
+      expect(m.usage.kind).toBe("claude");
+      // ...and the catalogue failure is still reported on its own terms.
+      expect(codes(m).some((c) => c.startsWith("catalog-"))).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("auto + discovered `.claude` with unparseable catalogue → still the token panel", () => {
+    const dir = treeWithBrokenCatalog(".claude");
+    try {
+      expect(assemble(dir, undefined, { window: "30d" }).usage.kind).toBe("claude");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

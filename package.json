@@ -1,0 +1,36 @@
+{
+  "name": "aidlc-dashboard",
+  "description": "Read-only web dashboard for an AI-DLC v2 run: status, progress, blockers, timing, health.",
+  "version": "1.13.0",
+  "private": true,
+  "author": "Amazon Web Services",
+  "license": "MIT-0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aws-samples/sample-aidlc-dashboard"
+  },
+  "type": "module",
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun --watch src/server.ts",
+    "test": "bun test",
+    "typecheck": "bunx tsc -p ./ --noEmit",
+    "lint": "bunx --bun @biomejs/biome check src/ scripts/",
+    "format": "bunx --bun @biomejs/biome format --write src/ scripts/",
+    "verify": "bun run typecheck && bun run lint && bun test && bun run audit",
+    "audit": "bun run scripts/audit-repo.ts",
+    "package": "bun run scripts/package.ts",
+    "set-repo": "bun run scripts/set-repo.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "1.9.4",
+    "@types/bun": "1.4.3",
+    "@types/node": "20.19.43",
+    "happy-dom": "20.14.5",
+    "typescript": "5.9.3"
+  },
+  "trustedDependencies": ["@biomejs/biome"]
+}

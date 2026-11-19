@@ -1,0 +1,1030 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
+// The single entry point: workspace root → DashboardModel.
+//
+// Read order matters in one place only — the stage catalogue is loaded FIRST
+// because the audit parser needs it to attribute Context-only events to the right
+// stage (see the Context shape note in scan/audit.ts). Everything else is
+// independent.
+//
+// Read-only throughout. No scan module throws, so a partially-synced tree
+// degrades to a thinner page with warnings rather than a 500.
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { type TokenViewModel, assembleTokens } from "../credit/claude/token-model";
+import { type TranscriptMemo, readTranscripts } from "../credit/claude/transcript-reader";
+import type { PollHalt } from "../credit/pipeline/polling-scheduler";
+import type { TrendWindow } from "../credit/trend/trend";
+import {
+  type CreditReadStore,
+  type CreditViewModel,
+  assembleCredit,
+} from "../credit/view/credit-model";
+import { type Strings, strings } from "../render/i18n";
+import { DEFAULT_LOCALE } from "../render/locale";
+import { readAgentCatalog } from "../scan/agent-catalog";
+import { type StageArtifact, listStageArtifacts } from "../scan/artifacts";
+import { type AuditLedger, chainIsClean, readAuditLedger } from "../scan/audit";
+import { readCheckpointProofs } from "../scan/checkpoint-proofs";
+import {
+  type ClaimInputs,
+  applicableStamp,
+  claimFilter,
+  readClaimInputs,
+  unitGateRhythm,
+} from "../scan/claim-attempt";
+import { readDeferrals } from "../scan/deferrals";
+import { ENGINE_DIR } from "../scan/engine-dir";
+import { readHealth } from "../scan/hooks-health";
+import { readRegistryRows } from "../scan/intent-registry";
+import { type StateCompat, readUnitLifecycle, scanConstructionMatrix } from "../scan/matrix";
+import { readDiaries } from "../scan/memory-diary";
+import { type StageStatus, type UnitProgress, parseState } from "../scan/parser";
+import { readQuestions } from "../scan/questions";
+import { type NoRunKind, recordDirMatches, resolveState } from "../scan/resolve";
+import { buildRework } from "../scan/rework";
+import {
+  type RunPosition,
+  readDirectiveMarker,
+  resolvePosition,
+  stateDigest,
+} from "../scan/run-position";
+import { readSensorReport } from "../scan/sensors";
+import { type StageCatalog, harnessDirsWithCatalog, readStageCatalog } from "../scan/stage-catalog";
+import { KNOWN_PER_UNIT_STAGES, type StageIndex } from "../scan/stage-jump";
+import { buildTiming } from "../scan/timing";
+import { unitArtifactMode } from "../scan/unit-artifact-mode";
+import { type UnitDag, resolveUnitDag } from "../scan/unit-dag";
+import { MAX_VIEW_BYTES } from "../scan/view-file";
+import { buildAgents } from "./agents";
+import { readErrors } from "./errors";
+import { buildProvenance, graphLastEvent } from "./freshness";
+import type {
+  Blocker,
+  DashboardModel,
+  GateSummary,
+  RunIdentity,
+  UnitDagStop,
+  UsageMode,
+  UsageView,
+  Warning,
+} from "./types";
+import { buildWaits, ledgerWaitInputs } from "./waits";
+
+/** Newest events kept for the stream panel. The full ledger stays server-side. */
+const RECENT_EVENT_LIMIT = 300;
+
+/**
+ * What the host injects so `assemble` can fill the usage slot: the read-only
+ * snapshot store (u1, Kiro side), the trend window the request asked for (u4
+ * parses `?cw=`), and the per-file memo the Claude side reuses across polls.
+ * Optional — omitted, the usage slot degrades to an empty view of the resolved
+ * kind, which keeps every caller and test that never passes it working unchanged.
+ */
+export interface UsageContext {
+  /** Kiro snapshot store. Absent → the credit view degrades to `none`. */
+  store?: CreditReadStore;
+  window: TrendWindow;
+  collecting?: boolean;
+  /** Why automatic collection stopped, when it has. Read-only runtime state, threaded
+   *  like `collecting` rather than stored — the model must not own process state. */
+  pollHalt?: PollHalt | null;
+  /** Which panel to show. Default `auto` (resolved from the harness dir). */
+  mode?: UsageMode;
+  /** Claude transcript memo, held by the host for the process lifetime. */
+  memo?: TranscriptMemo;
+  /** Home dir override (tests). */
+  home?: string;
+}
+
+/**
+ * Which usage provider to run. `auto` reads the harness dir: a workspace whose
+ * catalogue came from `.claude` was driven by Claude Code, so its usage lives in
+ * Claude Code's transcripts. Anything else — including no harness dir at all —
+ * falls back to the Kiro credit panel, which degrades to an empty view on its own
+ * when nothing has been collected.
+ */
+function resolveUsageKind(mode: UsageMode, harnessDir: string | undefined): "kiro" | "claude" {
+  if (mode !== "auto") return mode;
+  return harnessDir === ".claude" ? "claude" : "kiro";
+}
+
+/** Message out of an unknown throw — the shape both usage-assembly catches want. */
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** The empty token view used when Claude assembly fails. */
+function emptyTokens(window: TrendWindow): TokenViewModel {
+  return {
+    status: "none",
+    totals: { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, thinking: 0 },
+    grandTotal: 0,
+    cachedPromptRatio: null,
+    sessionTime: null,
+    byModel: [],
+    messages: 0,
+    sidechainMessages: 0,
+    sessions: 0,
+    trend: { window, points: [], summary: { latest: null, min: null, max: null, count: 0 } },
+    lastActivityAt: null,
+    firstActivityAt: null,
+    dir: null,
+    triedPath: "",
+    notes: [],
+  };
+}
+
+/** The empty credit view used when no store is wired or assembly fails (BR1.4). */
+function emptyCredit(window: TrendWindow, collecting = false): CreditViewModel {
+  return {
+    status: collecting ? "loading" : "none",
+    current: null,
+    lastSuccessAt: null,
+    freshness: { stale: false, lastSuccessAt: null },
+    trend: { window, points: [], summary: { latest: null, min: null, max: null, count: 0 } },
+    warning: null,
+    pollHalt: null,
+  };
+}
+
+/** The sentence for each no-run reason — the server and the terminal say the same thing. */
+export function noRunText(t: Strings["cli"], kind: NoRunKind, root: string, archived = 0): string {
+  switch (kind) {
+    case "ambiguous":
+      return t.intentAmbiguous(root);
+    case "archived":
+      return t.intentArchived(root, archived);
+    default:
+      return t.noWorkflow(root);
+  }
+}
+
+/** Thrown only when there is no run to show at all. */
+export class NoRunError extends Error {
+  /**
+   * `message` is built with the DEFAULT catalogue, because `assemble` has no locale — see
+   * `render/locale.ts` for why it must not take one. `kind` and `root` are the facts, so
+   * the server re-renders the sentence in the reader's language from those instead of
+   * showing this string (`errorPage`); `message` is what reaches the terminal.
+   */
+  constructor(
+    readonly kind: NoRunKind,
+    readonly root: string,
+    /** How many archived records were set aside, for `archived`. */
+    readonly archived = 0,
+  ) {
+    super(noRunText(strings(DEFAULT_LOCALE).cli, kind, root, archived));
+    this.name = "NoRunError";
+  }
+}
+
+/**
+ * The catalogue's stage order for `stageJumpReaches`, with `isPerUnitStage` (a stage's
+ * `for_each: unit-of-work`, or one of the engine's five known per-unit stages).
+ */
+function catalogStageIndex(catalog: StageCatalog | undefined): StageIndex | undefined {
+  if (!catalog) return undefined;
+  // The engine's graph holds enabled stages only (`loadStageGraph`): a disabled one has no
+  // index, and is not per-unit for a kept jump.
+  const walked = catalog.stages.filter((x) => x.enabled !== false);
+  return Object.assign((s: string) => walked.findIndex((x) => x.slug === s), {
+    perUnit: (s: string) =>
+      catalog.bySlug.get(s)?.forEach === "unit-of-work" || KNOWN_PER_UNIT_STAGES.has(s),
+  });
+}
+
+function isoNow(): string {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+/** Registry metadata for the active record, when intents.json lists it. */
+function readRegistry(
+  root: string,
+  space: string,
+  record: string,
+): { slug?: string; scope?: string; status?: string } {
+  const doc = readRegistryRows(path.join(root, "aidlc", "spaces", space, "intents"));
+  try {
+    for (const e of doc) {
+      if (typeof e !== "object" || e === null) continue;
+      const r = e as Record<string, unknown>;
+      // The engine's join rule: a stored dirName, else the legacy `<slug>-<id8>` shape.
+      if (typeof r.slug !== "string") continue;
+      // The raw values, as scan/resolve.ts sees them — coercing a wrong-typed dirName
+      // to "absent" let identity join a row the resolver had not.
+      const row = { slug: r.slug, uuid: r.uuid, dirName: r.dirName };
+      if (!recordDirMatches(row, record)) continue;
+      return {
+        slug: typeof r.slug === "string" ? r.slug : undefined,
+        scope: typeof r.scope === "string" ? r.scope : undefined,
+        status: typeof r.status === "string" ? r.status : undefined,
+      };
+    }
+  } catch {
+    // A row the join cannot read: identity falls back to the dir name.
+  }
+  return {};
+}
+
+/**
+ * A turn marker's mtime in ms, as the engine's `turnMarkerStat` reads it: a regular
+ * file reached without a symlink, else undefined.
+ */
+function markerMtimeMs(p: string): number | undefined {
+  try {
+    const st = fs.lstatSync(p);
+    return st.isFile() ? st.mtimeMs : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The receipt reader's policy, as the engine's lifecycle readers derive it from the state
+ * (scan/unit-receipts.ts): unit-major means the iteration OR checkpoints; per-unit floors
+ * also under team ownership; and receipts are REQUIRED — `inUse` with no unit row at all —
+ * when `constructionCheckpointsApply`: checkpoints enabled, not team, and the scope holds a
+ * per-unit stage that writes code. The scope test is approximated by the state rows: a
+ * per-unit `workspace_requires` stage the state marks EXECUTE.
+ */
+function receiptPolicy(
+  state: ReturnType<typeof parseState>,
+  catalog: StageCatalog | undefined,
+  claim: ClaimInputs,
+): NonNullable<Parameters<typeof readUnitLifecycle>[1]> {
+  // `isTeamUnitOwnership`, exactly: the field trimmed and equal to `team`.
+  const team = claim.team;
+  const checkpoints = state.constructionCheckpoints === "enabled";
+  const unitMajor = state.constructionIteration?.trim() === "unit-major" || checkpoints;
+  // Construction rows only, and not a stage the run skipped at runtime (`[S]`): the
+  // engine's `unitMajorConstructionStageSlugs` excludes it, and counting it here turned
+  // every other stage's artifact-only cells unsettled. Not reproduced: the scope's own
+  // default for a stage the state has no row for, and an unknown scope (which the engine
+  // reads as not applying) — both rare in a state the engine wrote.
+  // `unitMajorConstructionStageSlugs` returns nothing for a scope the grid does not know.
+  const scopeKnown = catalog?.scopeGrid ? state.scope in catalog.scopeGrid : true;
+  const codeStage =
+    scopeKnown &&
+    (state.phases.find((p) => p.key === "construction")?.stages ?? []).some((s) => {
+      const c = catalog?.bySlug.get(s.slug);
+      return (
+        s.execute &&
+        s.status !== "skipped" &&
+        c?.forEach === "unit-of-work" &&
+        c.workspaceRequires === true
+      );
+    });
+  return {
+    unitMajor,
+    teamOwnership: team,
+    claim: claimFilter(claim),
+    unitScoped: team || unitMajor,
+    receiptsRequired: checkpoints && !team && codeStage,
+    stageIndex: catalogStageIndex(catalog),
+  };
+}
+
+/** The team unit gate's inputs: the claim filter, the gate scope and the stamp's unit. */
+function teamGateInput(claim: ClaimInputs, stateText: string) {
+  const stamp = applicableStamp(claim);
+  return {
+    claim: claimFilter(claim),
+    scope: unitGateRhythm(claim, stateText),
+    ...(stamp && stamp !== "unknown" ? { stampUnit: stamp.unit } : {}),
+  };
+}
+
+/**
+ * Whether the source viewer shows a shard whole. `/view` reads a prefix of
+ * MAX_VIEW_BYTES, so a link to a larger shard opens on its oldest rows and the error
+ * the link was for is not on the page — a link that misleads is worse than none. The
+ * shard is held to the audit reader's own rules again (a regular file, no link on the
+ * chain from the workspace root), so a path swapped for a link after the ledger was read
+ * does not get a link to a file the ledger never read.
+ */
+function shardViewable(root: string, recordDir: string, shard: string): boolean {
+  const abs = path.join(recordDir, "audit", shard);
+  try {
+    const st = fs.lstatSync(abs);
+    return st.isFile() && st.size <= MAX_VIEW_BYTES && chainIsClean(root, path.relative(root, abs));
+  } catch {
+    return false;
+  }
+}
+
+/** Gate ledger from the audit + the revision count state.md tracks. */
+function buildGates(
+  ledger: AuditLedger,
+  revisionCount: string | undefined,
+  awaiting?: string,
+): GateSummary {
+  const n = (k: string) => ledger.counts.get(k) ?? 0;
+  const rev =
+    revisionCount && /^\d+$/.test(revisionCount.trim()) ? Number(revisionCount.trim()) : undefined;
+  return {
+    approved: n("GATE_APPROVED"),
+    rejected: n("GATE_REJECTED"),
+    revisionCount: rev,
+    awaitingStage: awaiting,
+    jumps: n("STAGE_JUMPED"),
+  };
+}
+
+/**
+ * Lift unanswered questions into blockers, current stage first.
+ *
+ * Not every blank `[Answer]:` is live: a question parked mid-run stays blank
+ * forever, so `isCurrentStage` separates "the run is waiting on this right now"
+ * from "this was abandoned earlier". Both are shown — a stale one is a real loose
+ * end — but only the current-stage ones are the reason the run is stopped.
+ */
+function buildBlockers(
+  questions: ReturnType<typeof readQuestions>,
+  position: RunPosition,
+  now: string,
+  /** The plan runs per-unit stages at stage level: "no unit" is known, not unknown. */
+  stageLevel: boolean,
+): Blocker[] {
+  const out: Blocker[] = [];
+  for (const f of questions.blocked) {
+    for (const q of f.unanswered) {
+      const since = f.mtime;
+      const parsed = Date.parse(since);
+      out.push({
+        stage: f.stage,
+        unit: f.unit,
+        heading: q.heading,
+        kind: q.kind,
+        invalidTags: q.invalidTags,
+        rel: f.rel,
+        occurrence: q.occurrence,
+        since,
+        waitingSec: Number.isFinite(parsed)
+          ? Math.max(0, (Date.parse(now) - parsed) / 1000)
+          : undefined,
+        // The stage the run is on, and — when the position names one — the unit: a
+        // blank ask in another unit's copy of the same stage is not what holds it.
+        // With no unit known, every unit's copy counts: under unit-major that only
+        // happens on a position the run line already labels unverified, and filing
+        // them all as "earlier" would bring back the false "nothing waiting" this
+        // reading exists to remove. Over-claiming under a visible label beats hiding.
+        // At stage level the run HAS no unit — the engine's stage-level question reader
+        // (`summaryQuestionFiles`) reads `construction/<stage>/` only — so a unit's copy
+        // is earlier work, not the current ask.
+        isCurrentStage:
+          position.stage !== undefined &&
+          f.stage === position.stage &&
+          (stageLevel
+            ? f.unit === undefined
+            : position.unit === undefined || f.unit === position.unit),
+      });
+    }
+  }
+  // Current stage first, then newest ask first.
+  return out.sort((a, b) => {
+    if (a.isCurrentStage !== b.isCurrentStage) return a.isCurrentStage ? -1 : 1;
+    return a.since > b.since ? -1 : a.since < b.since ? 1 : 0;
+  });
+}
+
+/** The one field worth showing beside an event in the stream. */
+function eventDetail(fields: Record<string, string>): string | undefined {
+  for (const k of [
+    "Details",
+    "Reason",
+    "Sensor ID",
+    "Question",
+    "Decision",
+    "Target",
+    "Error",
+    "Source",
+  ]) {
+    const v = fields[k];
+    if (v && v.length > 0) return v;
+  }
+  return undefined;
+}
+
+/**
+ * Read the workspace and assemble the model. `harnessDir` pins the harness the
+ * stage catalogue is read from; omitted, it is discovered (see
+ * scan/stage-catalog.ts — harness-agnostic by design, since the `aidlc/` docs
+ * tree is identical across Kiro CLI/IDE and Claude Code). Throws
+ * NoRunError only when no intent record can be resolved; every other failure
+ * becomes a warning.
+ *
+ * The docs tree stays harness-neutral; the ONE panel that is not is usage, since
+ * the two harnesses expose usage through different mechanisms. `usageCtx.mode`
+ * picks the panel (default `auto` — see resolveUsageKind).
+ */
+/**
+ * Whether `## Unit Progress` still describes the roster the engine would rebuild it from.
+ * The engine's `deriveTeamUnitProgressModel` re-reads the DAG on every `next` and refuses
+ * one that is not `ok`, so a table whose unit set differs — or one beside a DAG the engine
+ * cannot read — is the last projection written, not the current authority. Only the unit
+ * SET is compared: the cells are the engine's own and this reader does not re-derive them.
+ */
+function unitProgressStaleness(
+  up: UnitProgress | undefined,
+  dag: UnitDag,
+): Pick<DashboardModel, "unitProgressStale"> {
+  if (!up || up.malformed || up.rows.length === 0 || dag.state === "none") return {};
+  if (dag.state === "malformed") return { unitProgressStale: { kind: "dag-unreadable" } };
+  const table = new Set(up.rows.map((r) => r.unit));
+  const roster = new Set(dag.units);
+  const missing = dag.units.filter((u) => !table.has(u));
+  const extra = up.rows.map((r) => r.unit).filter((u) => !roster.has(u));
+  return missing.length || extra.length
+    ? { unitProgressStale: { kind: "roster", missing, extra } }
+    : {};
+}
+
+export function assemble(
+  root: string,
+  harnessDir?: string,
+  usageCtx?: UsageContext,
+): DashboardModel {
+  const resolved = resolveState(root);
+  if (resolved.kind !== "ok") {
+    throw new NoRunError(resolved.kind, root, resolved.kind === "archived" ? resolved.count : 0);
+  }
+
+  const now = isoNow();
+  const warnings: Warning[] = [];
+
+  const statePath = path.join(root, resolved.rel);
+  const recordDir = path.dirname(statePath);
+  const graphPath = path.join(recordDir, "runtime-graph.json");
+
+  // Discover every harness dir that ships a catalogue ONCE. The first entry is the
+  // same winner `findHarnessDir` would pick (identical probe order), and the full
+  // list is what the usage panel needs to notice coexistence — so doing it here
+  // replaces two separate directory scans with one.
+  const harnesses = harnessDirsWithCatalog(root);
+  const discoveredHarness = harnessDir ?? harnesses[0];
+
+  // FIRST: the catalogue, so audit attribution can consult it.
+  let catalog: StageCatalog | undefined;
+  try {
+    catalog = readStageCatalog(root, discoveredHarness);
+  } catch {
+    catalog = undefined;
+  }
+  if (!catalog) {
+    warnings.push(
+      harnessDir ? { code: "catalog-read-failed", harnessDir } : { code: "catalog-not-found" },
+    );
+  }
+  const isStage = catalog ? (s: string) => catalog?.bySlug.has(s) : undefined;
+
+  let stateText: string;
+  try {
+    stateText = fs.readFileSync(statePath, "utf-8");
+  } catch {
+    throw new NoRunError("none", root);
+  }
+  // Display names come from the tree's own catalogue when it has one — the local table
+  // in scan/parser.ts is a snapshot of the engine's stage roster and had already gone
+  // stale (v2.7's `domain-design` / `contract-design` were missing).
+  const state = parseState(
+    stateText,
+    catalog ? (s) => catalog?.bySlug.get(s)?.name : undefined,
+    catalog?.scopeGrid,
+  );
+
+  // A plan that skips Units Generation has no units: per-unit stages run once at stage
+  // level (scan/unit-artifact-mode.ts). The matrix and the current-blocker test both read
+  // it. The scope grid is the catalogue's, refused or not — the plan action is the
+  // state's own fact, not a contract judgement.
+  const artifactMode = unitArtifactMode(
+    stateText,
+    catalog?.scopeGrid,
+    catalog?.stages.filter((s) => s.enabled !== false).map((s) => s.slug),
+  );
+  // The unit roster, resolved as the engine resolves it: the authored DAG first, the
+  // runtime graph only as a cache that still matches it (scan/unit-dag.ts). The engine's
+  // Construction routing asks for it only where per-unit stages run per unit, so a
+  // stage-level plan's malformed file stops nothing there and gets no warning (other
+  // engine readers — team ownership, the board — still resolve it; none is a stop the
+  // page reports).
+  const unitDag = resolveUnitDag(recordDir);
+  // The engine refuses an unreadable block at Units Generation's own gate
+  // (`checkStageCompletionEvidence`), so while that stage is open the file may simply be
+  // mid-write; once it has closed, every per-unit stage stops on it.
+  const unitDagStop: UnitDagStop =
+    state.phases.flatMap((p) => p.stages).find((s) => s.slug === "units-generation")?.status ===
+    "done"
+      ? "construction"
+      : "units-generation-gate";
+  if (unitDag.state === "malformed" && artifactMode !== "stage-level") {
+    warnings.push({
+      code: "unit-dag-malformed",
+      reason: unitDag.reason,
+      detail: unitDag.detail,
+      stop: unitDagStop,
+    });
+  }
+
+  const ledger = readAuditLedger(recordDir, isStage, root);
+  // A refusal or an unreadable shard explains an empty readable ledger; `audit-empty`
+  // guesses at hooks that never fired, so it is kept for the emptiness nothing else explains.
+  const refused = ledger.refused ?? [];
+  const unread = ledger.unread ?? [];
+  if (refused.length > 0) warnings.push({ code: "audit-shard-refused", paths: refused });
+  if (unread.length > 0) warnings.push({ code: "audit-shard-unread", paths: unread });
+  if (refused.length === 0 && unread.length === 0 && ledger.events.length === 0)
+    warnings.push({ code: "audit-empty" });
+
+  const sensors = readSensorReport(recordDir, ledger);
+  const questions = readQuestions(recordDir, { isStage });
+  // Read as text rather than hidden, so a typo cannot make a blocker vanish — but
+  // that is a guess about what the author meant, and the page says so.
+  if (questions.unclosed.length > 0) {
+    warnings.push({ code: "questions-unclosed-block", files: questions.unclosed });
+  }
+  // Where the run is: the unit cache, then a directive issued against this exact
+  // state, then Current Stage — see scan/run-position.ts.
+  const marker = readDirectiveMarker(recordDir, stateText);
+  const position = resolvePosition({
+    currentStage: state.currentStage,
+    unitStage: state.runtime.unitStage,
+    activeUnit: state.runtime.activeUnit,
+    constructionIteration: state.constructionIteration ?? "",
+    isPerUnit: catalog ? (s) => catalog?.bySlug.get(s)?.forEach === "unit-of-work" : undefined,
+    marker,
+    // A stage-level plan has no units to check the cache against (scan/unit-artifact-mode.ts).
+    rosterUnits:
+      artifactMode === "stage-level"
+        ? undefined
+        : unitDag.state === "ok"
+          ? unitDag.units
+          : unitDag.state === "malformed"
+            ? null
+            : undefined,
+    stageLevel: artifactMode === "stage-level",
+  });
+  const diaries = readDiaries(recordDir);
+  const health = readHealth(recordDir);
+  const blockers = buildBlockers(questions, position, now, artifactMode === "stage-level");
+  // The claim attempt's checkout-local inputs (scan/claim-attempt.ts) — read, never written.
+  // The receipts and the team unit gate both filter by them.
+  const claim = readClaimInputs(root, stateText);
+  const waits = buildWaits({
+    state,
+    position,
+    marker,
+    teamGate: claim.team ? teamGateInput(claim, stateText) : undefined,
+    ...ledgerWaitInputs(ledger),
+    questions,
+    blockers,
+    checkoutParkFile: fs.existsSync(path.join(root, "aidlc", ".aidlc-unit-parked")),
+    guard: health.stopGuard
+      ? { signature: health.stopGuard.signature, stateDigest: stateDigest(stateText) }
+      : undefined,
+    hookHeartbeats: health.heartbeats,
+    marks: {
+      turnEnd: markerMtimeMs(path.join(recordDir, ENGINE_DIR, "turn-end")),
+      humanTurn: markerMtimeMs(path.join(recordDir, ENGINE_DIR, "human-turn")),
+    },
+    now,
+    stageIndex: catalogStageIndex(catalog),
+    stageLevel: artifactMode === "stage-level",
+  });
+  const timing = buildTiming(ledger, now);
+  // Agent definitions from the same harness dir the catalogue came from — declared, never
+  // run; the Agents tab's figures come from the ledger (model/agents.ts).
+  const agentHarness = catalog?.harnessDir ?? discoveredHarness;
+  const agentCatalog = agentHarness ? readAgentCatalog(root, agentHarness) : undefined;
+  const ranStages = new Set(
+    state.phases.flatMap((p) =>
+      p.stages.filter((st) => st.execute && st.status !== "skipped").map((st) => st.slug),
+    ),
+  );
+  const agents = buildAgents({
+    events: ledger.events,
+    position,
+    now,
+    catalog,
+    agentCatalog,
+    inScope: ranStages.size > 0 ? (slug) => ranStages.has(slug) : undefined,
+    unitMajor: (slug) =>
+      catalog?.bySlug.get(slug)?.forEach === "unit-of-work" &&
+      (state.constructionIteration?.trim() === "unit-major" ||
+        state.constructionCheckpoints === "enabled"),
+    // `reviewAttemptAccounting`'s `unitScopedRejections` (`unitScopedLifecycleFloors`) and
+    // `teamOwnership`, on a per-unit stage only.
+    rejectionScope: (slug) => {
+      const perUnit = catalog?.bySlug.get(slug)?.forEach === "unit-of-work";
+      const checkpoints = state.constructionCheckpoints === "enabled";
+      return {
+        unitScoped:
+          perUnit &&
+          (claim.team || checkpoints || state.constructionIteration?.trim() === "unit-major"),
+        team: perUnit && (claim.team || checkpoints),
+      };
+    },
+  });
+
+  // The deferral ledger needs to know where each assigned stage currently stands.
+  // Keyed by slug with EVERY occurrence's status, because a Construction stage slug
+  // repeats once per unit and "the stage this was deferred to has finished" is only
+  // true when all of its copies have — see scan/deferrals.ts.
+  const stageStatuses = new Map<string, StageStatus[]>();
+  for (const p of state.phases) {
+    for (const s of p.stages) {
+      const seen = stageStatuses.get(s.slug);
+      if (seen) seen.push(s.status);
+      else stageStatuses.set(s.slug, [s.status]);
+    }
+  }
+  const deferrals = readDeferrals(recordDir, {
+    stageStatuses,
+    catalogSlugs: catalog ? new Set(catalog.bySlug.keys()) : undefined,
+    isStage,
+    now,
+  });
+  // A record file that exists and could not be read is not absent: its blank answers,
+  // deferrals or diary entries are missing from every count built on it, so it is
+  // named once here (scan/record-read.ts). The declared ledgers say their own
+  // `unreadable` in the deferrals panel and are not repeated.
+  const unreadable = [
+    ...new Set([...questions.unreadable, ...deferrals.unreadable, ...diaries.unreadable]),
+  ].sort();
+  if (unreadable.length > 0) {
+    warnings.push({
+      code: "record-file-unreadable",
+      files: unreadable,
+      questions: questions.unreadable.length > 0,
+    });
+  }
+
+  // STATE / CATALOGUE COMPATIBILITY, measured rather than versioned.
+  //
+  // The engine refuses a state whose `State Version` does not match the compiled graph
+  // — `classifyStateVersion()` in aidlc-lib.ts, enforced by both `next`/`report` and
+  // `--doctor` — and names the reason: v2.7 (version 8) renamed `application-design` to
+  // `domain-design` and inserted `contract-design`, "so a pre-v8 state file's stage rows
+  // no longer match the compiled graph". Reading a v7 state against a v8 catalogue
+  // produces a plausible and wrong page, because every contract judgement below is made
+  // against the wrong contract.
+  //
+  // This does NOT hardcode the number. A pinned `8` would go stale the way the
+  // STAGE_DISPLAY table did, and it cannot see a hand-edited roster at all. What matters
+  // is the thing the version stands for, so compare the ROSTERS: a slug the state lists
+  // and the catalogue does not know (or the reverse) IS the incompatibility, and it is
+  // visible in the data on any version, present or missing.
+  //
+  // DIRECTION DEPENDS ON WHETHER THE VERSIONS AGREE, and the first reason given here for
+  // going one-directional was simply wrong: it claimed "a scope can exclude stages from
+  // enumeration", but the state contract says the engine emits "one checkbox row per
+  // compiled stage in that phase" and spells SKIP as a row (`- [ ] slug — SKIP: reason`).
+  // So when both sides declare a version AND the versions match, the state SHOULD list
+  // every compiled stage and a catalogue-only stage is a real divergence — compare both
+  // directions. When agreement cannot be established (either side silent), fall back to
+  // one direction: a state listing a stage the catalogue never heard of is unambiguous on
+  // any version, while the reverse there is just a thinner tree. That fallback is what
+  // keeps this repo's own version-less synthetic fixture from reporting a mismatch.
+  // The declared numbers, when BOTH sides declare one. The harness states the schema it
+  // supports in its own `aidlc-lib.ts`; the state file states the schema it was written
+  // against. A difference is what the engine refuses, and it is invisible to the roster
+  // check below when the roster happens to match — a state relabelled 7 on a v8 roster
+  // reads clean there, and the engine would still refuse to run it.
+  const harnessVersion = catalog?.stateVersion;
+  // A DECLARED difference blocks, exactly like a roster mismatch. Warning and then
+  // handing the same catalogue to the matrix anyway was the worst of both: the page said
+  // the two sources disagree and then judged v7 cells against the v8 contract regardless.
+  const versionMismatch =
+    harnessVersion !== undefined &&
+    state.stateVersion !== undefined &&
+    harnessVersion !== state.stateVersion;
+  // The three extra conditions are implied by `versionMismatch` — `harnessVersion` is
+  // read off the catalogue, so a mismatch cannot be detected without one. They are
+  // spelled out so the narrowing is real and the fields need no casts.
+  if (versionMismatch && catalog && state.stateVersion !== undefined && harnessVersion) {
+    warnings.push({
+      code: "state-version-mismatch",
+      stateVersion: state.stateVersion,
+      harnessVersion,
+      harnessDir: catalog.harnessDir,
+    });
+  }
+  // Missing / empty / non-numeric is `unparseable` to the engine and also refused. It is
+  // reported, but it does NOT block: the version field being absent says nothing about
+  // whether the ROSTER diverged, and the roster check below is what actually measures
+  // that. Blocking here would degrade the matrix to 2-state — which hides blocked units
+  // — on the strength of a missing label alone.
+  // THREE-VALUED, because "verified" was claiming something never done: with the harness
+  // silent about its own version there is nothing to compare against, so the honest
+  // answer is `unknown`, not `verified`.
+  const stateVersionReadable = state.stateVersion !== undefined && /^\d+$/.test(state.stateVersion);
+  const stateCompat: StateCompat = versionMismatch
+    ? "incompatible"
+    : stateVersionReadable && harnessVersion !== undefined
+      ? "verified"
+      : "unknown";
+  if (!stateVersionReadable) {
+    warnings.push({ code: "state-version-unreadable", stateVersion: state.stateVersion });
+  }
+
+  // TEAM / UNIT-MAJOR: the state's `## Unit Progress` table is the engine-owned authority
+  // for owner, per-unit stage state and gate, and it is parsed (scan/parser.ts) rather
+  // than reconstructed. What is reported here is when that authority is absent or in a
+  // shape the engine itself would refuse.
+  //
+  // AND, not OR. The contract is "present only when `Unit Ownership: team` AND
+  // `Construction Iteration: unit-major`", so `solo` + `unit-major` is a normal run with
+  // no such table and must not be told it is missing one. `team` WITHOUT `unit-major` is
+  // the misconfiguration, and gets its own line.
+  const team = state.unitOwnership?.toLowerCase() === "team";
+  const unitMajorMode = state.constructionIteration?.toLowerCase() === "unit-major";
+  const teamMode = team && unitMajorMode;
+  if (team && !unitMajorMode) {
+    warnings.push({
+      code: "team-without-unit-major",
+      constructionIteration: state.constructionIteration,
+    });
+  }
+  // The engine derives the table only from a valid non-empty Unit DAG AND a non-empty block
+  // of active, unskipped per-unit Construction stages (`deriveTeamUnitProgressModel` refuses
+  // either missing). At stage level, where neither is implied, an absent table is missing
+  // only when both hold; stage level alone does not settle it, because the derivation does
+  // not refuse stage level. Without a catalogue every executing Construction row is taken
+  // as per-unit — the side that keeps the warning.
+  const stageLevel = artifactMode === "stage-level";
+  const scopeInGrid = catalog?.scopeGrid ? state.scope in catalog.scopeGrid : true;
+  const derivable =
+    unitDag.state === "ok" &&
+    unitDag.units.length > 0 &&
+    scopeInGrid &&
+    (state.phases.find((p) => p.key === "construction")?.stages ?? []).some(
+      (st) =>
+        st.execute &&
+        st.status !== "skipped" &&
+        (catalog ? catalog.bySlug.get(st.slug)?.forEach === "unit-of-work" : true),
+    );
+  if (state.unitProgress?.malformed) {
+    warnings.push({ code: "unit-progress-malformed" });
+  } else if (teamMode && !state.unitProgress && (!stageLevel || derivable)) {
+    warnings.push({ code: "unit-progress-missing", ...(stageLevel ? { stageLevel: true } : {}) });
+  }
+
+  const stateSlugs = state.phases.flatMap((p) => p.stages.map((st) => st.slug));
+  const unknownToCatalog = catalog ? stateSlugs.filter((sl) => !catalog?.bySlug.has(sl)) : [];
+  const versionsAgree =
+    harnessVersion !== undefined && state.stateVersion !== undefined && !versionMismatch;
+  const missingFromState =
+    catalog && versionsAgree
+      ? [...catalog.bySlug.keys()].filter((sl) => !stateSlugs.includes(sl))
+      : [];
+  const rosterMismatch = unknownToCatalog.length > 0 || missingFromState.length > 0;
+  if (rosterMismatch) {
+    warnings.push({
+      code: "roster-mismatch",
+      stateVersion: state.stateVersion,
+      unknownToCatalog,
+      missingFromState,
+    });
+  }
+
+  const construction = state.phases.find((p) => p.key === "construction");
+  // The same catalogue the matrix is given: one it refused (roster or version mismatch)
+  // must not keep steering the receipt policy or the jump order either.
+  const policy = receiptPolicy(
+    state,
+    rosterMismatch || versionMismatch ? undefined : catalog,
+    claim,
+  );
+  const matrix =
+    construction && artifactMode !== "stage-level"
+      ? // A mismatched roster means the catalogue describes a different run shape, so the
+        // matrix must not claim contract-awareness. Withholding the catalogue routes it
+        // through the existing, already-loud 2-state degradation instead of inventing a
+        // second "degraded" mode.
+        scanConstructionMatrix(
+          recordDir,
+          construction.stages,
+          rosterMismatch || versionMismatch ? undefined : catalog,
+          // Completion receipts come from the audit. Where a stage uses the unit
+          // lifecycle they outrank artifact presence — the engine's own rule.
+          readUnitLifecycle(ledger.events, policy),
+          // An unverified version does NOT throw the contract away — it withholds the claim
+          // that the judgement matches the engine's. Separate axes, not one.
+          stateCompat,
+          unitDag,
+        )
+      : undefined;
+  // Where the engine's routing resolves a unit checkpoint and so reads its proof:
+  // `receiptsRequired` is this reader's `constructionCheckpointsApply`, here only with a
+  // scope grid that knows the scope (an unknown scope applies nothing, and with no grid
+  // the policy cannot tell); and the run has units of its own — not
+  // `usesStageLevelPerUnitArtifacts` (Units Generation neither EXECUTE nor completed).
+  const ownUnits = artifactMode === "per-unit";
+  const scopeKnown = catalog?.scopeGrid !== undefined && state.scope in catalog.scopeGrid;
+  const checkpointProofs =
+    matrix && policy.receiptsRequired && scopeKnown && ownUnits
+      ? readCheckpointProofs(
+          recordDir,
+          matrix.units.map((u) => u.name),
+          state.skeletonStance,
+          matrix.batches.flat()[0],
+        )
+      : [];
+
+  // Per-stage file listing for the overview's expandable rows, keyed the way the
+  // renderer identifies a row. SKIP stages are scanned too — a skipped stage that
+  // somehow has files on disk is worth seeing — and each scan is one readdir.
+  //
+  // CONSTRUCTION LIVES AT TWO DEPTHS. `construction/` holds BOTH per-unit dirs
+  // (`construction/PU-1-.../code-generation/`) and the global stage dirs
+  // (`construction/code-generation/`), and the 2.11 state has one row per stage, not
+  // one per unit, so the row cannot say which. For Construction we scan the global dir
+  // AND every unit the matrix roster knows, then merge — whichever exists contributes.
+  // Without the merge those files are invisible.
+  const artifacts: Record<string, StageArtifact[]> = {};
+  const units = matrix ? matrix.units.map((u) => u.name) : [];
+  for (const p of state.phases) {
+    for (const s of p.stages) {
+      const key = `${p.key}/${s.slug}`;
+      if (artifacts[key]) continue;
+      const merged = listStageArtifacts(recordDir, p.key, s.slug);
+      if (p.key === "construction") {
+        for (const u of units) merged.push(...listStageArtifacts(recordDir, p.key, s.slug, u));
+        // Re-sort across the merge: each listStageArtifacts call sorted its own
+        // directory, but concatenation puts the global dir's files before every
+        // unit's regardless of name. Unit-major, matching the per-call order.
+        merged.sort(
+          (a, b) => (a.unit ?? "").localeCompare(b.unit ?? "") || a.name.localeCompare(b.name),
+        );
+      }
+      artifacts[key] = merged;
+    }
+  }
+
+  // Quantify the graph's drift so the badge can say what is actually missing,
+  // rather than only that it is old.
+  let sensorDrift: { fired: number; missing: number } | undefined;
+  const graphFired = ((): number | undefined => {
+    try {
+      const doc = JSON.parse(fs.readFileSync(graphPath, "utf-8"));
+      if (!Array.isArray(doc?.stages)) return undefined;
+      return doc.stages.reduce(
+        (n: number, s: Record<string, unknown>) =>
+          n + (Array.isArray(s.sensor_firings) ? s.sensor_firings.length : 0),
+        0,
+      );
+    } catch {
+      return undefined;
+    }
+  })();
+  if (graphFired !== undefined && sensors.totalFired > graphFired) {
+    sensorDrift = { fired: sensors.totalFired, missing: sensors.totalFired - graphFired };
+  }
+
+  const provenance = buildProvenance({
+    now,
+    auditLastTs: ledger.lastTs,
+    stateLastUpdated: state.lastUpdated,
+    statePath,
+    graphPath,
+    graphLastEventTs: graphLastEvent(graphPath),
+    hooksLastActivity: health.lastActivity,
+    catalogPath: catalog?.sourcePath,
+    agentCatalogAsOf: agentCatalog?.asOf,
+    sensorDrift,
+  });
+
+  // resolved.rel is `aidlc/spaces/<space>/intents/<record>/aidlc-state.md`.
+  const relParts = resolved.rel.split("/");
+  const space = relParts[2] ?? "default";
+  const record = relParts[4] ?? path.basename(recordDir);
+
+  const identity: RunIdentity = {
+    root,
+    space,
+    record,
+    stateRel: resolved.rel,
+    recordDir,
+    harnessDir: catalog?.harnessDir,
+    ...readRegistry(root, space, record),
+  };
+
+  // Usage slot. Which provider runs is resolved here, then that provider's
+  // assembly is isolated: both read outside the workspace (SQLite handle / home
+  // dir) and a failure there must degrade the one panel, never the dashboard
+  // (BR1.4 / NFR1.5).
+  const window = usageCtx?.window ?? "30d";
+  const mode = usageCtx?.mode ?? "auto";
+  // Resolve against the harness that was ASKED FOR or discovered, not the one the
+  // catalogue reports: a `--harness .claude` whose stage-graph.json is unreadable
+  // leaves `catalog` undefined, and reading the kind off the catalogue would then
+  // silently show the credit panel for a Claude run.
+  const usageKind = resolveUsageKind(mode, catalog?.harnessDir ?? discoveredHarness);
+  if (mode === "auto" && harnesses.length > 1) {
+    warnings.push({ code: "harness-coexist", harnesses, chosen: usageKind });
+  }
+
+  let usage: UsageView;
+  if (usageKind === "claude") {
+    try {
+      const agg = readTranscripts(root, window, {
+        home: usageCtx?.home,
+        now: new Date(now),
+        memo: usageCtx?.memo,
+      });
+      usage = { kind: "claude", tokens: assembleTokens(agg, window) };
+    } catch (err) {
+      warnings.push({ code: "token-usage-failed", detail: errText(err) });
+      usage = { kind: "claude", tokens: emptyTokens(window) };
+    }
+  } else if (usageCtx?.store) {
+    try {
+      usage = {
+        kind: "kiro",
+        credit: assembleCredit(
+          usageCtx.store,
+          new Date(now),
+          window,
+          usageCtx.collecting,
+          usageCtx.pollHalt ?? null,
+        ),
+      };
+    } catch (err) {
+      warnings.push({ code: "credit-assembly-failed", detail: errText(err) });
+      usage = { kind: "kiro", credit: emptyCredit(window, usageCtx.collecting) };
+    }
+  } else {
+    usage = { kind: "kiro", credit: emptyCredit(window, usageCtx?.collecting) };
+  }
+
+  const recent = ledger.events
+    .slice(-RECENT_EVENT_LIMIT)
+    .reverse()
+    .map((e) => ({
+      ts: e.ts,
+      event: e.event,
+      stage: e.stage,
+      unit: e.unit,
+      detail: eventDetail(e.fields),
+      shard: e.shard,
+    }));
+
+  return {
+    generatedAt: now,
+    identity,
+    state,
+    matrix,
+    unitArtifactMode: artifactMode,
+    unitMajorStages:
+      artifactMode !== "stage-level" && state.constructionIteration?.trim() === "unit-major"
+        ? catalog
+          ? (state.phases.find((p) => p.key === "construction")?.stages ?? [])
+              .filter(
+                (st) =>
+                  st.execute &&
+                  st.status !== "skipped" &&
+                  catalog.bySlug.get(st.slug)?.forEach === "unit-of-work",
+              )
+              .map((st) => st.slug)
+          : [...new Set(timing.units.map((u) => u.stage))]
+        : [],
+    unitDag:
+      unitDag.state === "ok"
+        ? { state: "ok", graphDiffers: unitDag.graphDiffers }
+        : unitDag.state === "malformed"
+          ? { ...unitDag, stop: unitDagStop }
+          : unitDag,
+    ...unitProgressStaleness(state.unitProgress, unitDag),
+    checkpointProofs,
+    sensors,
+    questions,
+    diaries,
+    deferrals,
+    health,
+    timing,
+    blockers,
+    // The gate claim comes from the state row, as the engine's does — see model/waits.ts.
+    gates: buildGates(ledger, state.revisionCount, waits.gate?.stage),
+    waits,
+    rework: buildRework(ledger),
+    errors: readErrors(ledger.events, {
+      complete: state.complete,
+      copyGroups: ledger.copyGroups,
+      viewable: (shard) => shardViewable(root, recordDir, shard),
+    }),
+    agents,
+    usage,
+    eventCounts: [...ledger.counts].sort((a, b) => b[1] - a[1]),
+    recentEvents: recent,
+    totalEvents: ledger.events.length,
+    partialAudit:
+      (ledger.refused?.length ?? 0) + (ledger.unread?.length ?? 0) > 0
+        ? { notRead: (ledger.refused?.length ?? 0) + (ledger.unread?.length ?? 0) }
+        : undefined,
+    provenance,
+    warnings,
+    artifacts,
+  };
+}

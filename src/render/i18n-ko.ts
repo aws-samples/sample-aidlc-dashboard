@@ -1,0 +1,1378 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
+// Korean copy. The original, and the one calibrated against real run trees.
+//
+// Every string here was MOVED from the module that used to hold it, unchanged. The
+// golden-snapshot tests exist to keep it that way: `?lang=ko` output is asserted
+// byte-identical to what the dashboard rendered before the catalogue existed, so a
+// well-meaning reword shows up as a failing test rather than as drift.
+
+import type { ReceiptReason } from "../scan/matrix";
+import type {
+  AgentStrings,
+  BlockerStrings,
+  CardStrings,
+  CliStrings,
+  DeferralStrings,
+  ErrorPageStrings,
+  ExplorerStrings,
+  FreshnessStrings,
+  HealthStrings,
+  JourneyStrings,
+  KpiStrings,
+  OpenFileStrings,
+  OverviewStrings,
+  PageStrings,
+  PickerStrings,
+  StatusStrings,
+  Strings,
+  TimeSummaryStrings,
+  TimelineStrings,
+  UsageStrings,
+  ViewerStrings,
+  WarnStrings,
+} from "./i18n";
+/** What each `unverified` cause means — each one the engine could settle either way. */
+const RECEIPT_REASON_KO: Record<ReceiptReason, string> = {
+  "claim-unresolved":
+    "team 소유라 엔진은 claim 시도(Attempt Generation·scope stamp)에 맞는 기록만 읽는데, 그 판정에 필요한 intent 목록(intents.json)을 엔진도 읽지 못하는 모양입니다 — 이 유닛이 완료됐는지, 건너뛰었는지 감사 기록으로는 알 수 없습니다",
+  "claim-landing":
+    "team 소유라 엔진은 claim 시도에 맞는 기록만 읽는데, scope stamp 는 claim 이 합쳐지면 더 적용되지 않습니다 — 이 유닛 행이 Merged 라서 그 판정은 이 화면이 실행하지 않는 git 확인(merge-base --is-ancestor)에 달려 있습니다. 이 유닛이 완료됐는지, 건너뛰었는지 감사 기록으로는 알 수 없습니다",
+  "wave-fingerprint":
+    "산출물은 다 있고, 완료 수령증은 산출물 지문이 판정합니다 (wave 모드) — 감사 기록만으로는 엔진이 완료로 볼지 알 수 없습니다",
+  "ambiguous-floor":
+    "산출물은 다 있고, 같은 시각의 사본 간 경계 때문에 attempt floor 가 재현되지 않습니다 — 감사 기록만으로는 엔진이 완료로 볼지 알 수 없습니다",
+};
+
+const warn: WarnStrings = {
+  catalogReadFailed: (harnessDir) =>
+    `${harnessDir}/tools/data/stage-graph.json 읽기 실패 — 산출물 계약 판정과 stage 귀속이 근사값으로 하락`,
+
+  catalogNotFound:
+    "stage 카탈로그 미검출 (<root>/<harness>/tools/data/stage-graph.json, .kiro·.claude·.aidlc 등 탐색) — " +
+    "산출물 계약 판정과 stage 귀속이 근사값으로 하락. harness 트리가 다른 곳에 있으면 --harness 로 지정할 것",
+
+  auditEmpty: "감사 기록 비어 있음 — hook 미발화 가능성",
+  auditShardRefused: (paths) =>
+    `엔진 규칙대로 감사 기록 경로 ${paths.length}곳을 읽지 않았습니다 — symlink 를 거치거나, 워크스페이스 루트 밖이거나, 일반 파일이 아닙니다(루트 자체의 symlink 는 괜찮습니다). 감사에서 나온 수치·이력·'없음'은 읽은 기록만의 것입니다: ${paths.join(", ")}`,
+
+  auditShardUnread: (paths) =>
+    `감사 기록 파일 ${paths.length}개를 읽을 수 없었습니다(권한·입출력 오류 등, 엔진 규칙에 따른 거부는 아님). 감사에서 나온 수치·이력·'없음'은 읽은 기록만의 것입니다: ${paths.join(", ")}`,
+
+  stateVersionMismatch: (stateVersion, harnessVersion, harnessDir) =>
+    `state.md 은 State Version ${stateVersion}, harness 는 ${harnessVersion} 을 지원합니다 (${harnessDir}/tools/aidlc-lib.ts) — 엔진은 이 조합에서 next·report·doctor 를 모두 거부합니다. 다른 세대의 계약으로 판정할 수 없어 산출물 계약 판정을 내렸습니다`,
+
+  stateVersionUnreadable: (stateVersion) =>
+    `state.md 의 State Version 을 읽을 수 없습니다 (${stateVersion === undefined ? "필드 없음" : `값: ${stateVersion}`}) — 엔진은 누락·빈 값·비수치를 모두 거부합니다(aidlc-lib.ts classifyStateVersion). 산출물 계약은 그대로 보여주지만 엔진과 동일한 완료 판정이라고 주장하지 않습니다`,
+
+  teamWithoutUnitMajor: (constructionIteration) =>
+    `Unit Ownership 은 team 인데 Construction Iteration 이 unit-major 가 아닙니다 (${constructionIteration ?? "없음"}) — 엔진 계약은 이 둘을 함께 요구하고, 그때만 Unit Progress 표가 존재합니다. 설정을 확인할 것`,
+
+  unitProgressMalformed:
+    "state.md 의 `## Unit Progress` 표를 엔진이 정한 모양으로 읽지 못했습니다 (표가 줄 맨 앞에서 시작하지 않거나, 첫 열이 `unit` 이 아니거나, 구분선 폭이 헤더와 다름 — 엔진도 같은 조건에서 거부합니다). owner·유닛 게이트를 표시하지 않습니다",
+
+  unitProgressMissing: (stageLevel) =>
+    stageLevel
+      ? "team / unit-major 실행인데 state.md 에 `## Unit Progress` 절이 없습니다 — 엔진은 유닛 목록으로 이 표를 만들 수 있지만, 여기에는 owner·유닛 게이트의 권위 있는 원천이 없습니다"
+      : "team / unit-major 실행인데 state.md 에 `## Unit Progress` 절이 없습니다 — owner·유닛 게이트의 권위 있는 원천이 없어 아래 매트릭스는 디스크와 감사 기록으로 재구성한 값입니다",
+
+  rosterMismatch: (stateVersion, unknownToCatalog, missingFromState) => {
+    const ver = stateVersion ? `(State Version: ${stateVersion})` : "(State Version 없음)";
+    const engineNote = "엔진도 이 조합을 거부합니다: aidlc-lib.ts classifyStateVersion";
+    const unknown =
+      unknownToCatalog.length > 0
+        ? ` · 카탈로그가 모르는 stage: ${unknownToCatalog.join(", ")}`
+        : "";
+    const missing =
+      missingFromState.length > 0
+        ? ` · state 에 행이 없는 stage: ${missingFromState.join(", ")} (엔진은 SKIP 도 한 행씩 씁니다)`
+        : "";
+    return `state.md 과 stage 카탈로그의 stage 목록이 어긋납니다 ${ver}${unknown}${missing}. 산출물 계약 판정을 신뢰할 수 없어 근사값으로 내렸습니다 (${engineNote})`;
+  },
+
+  harnessCoexist: (harnesses, chosen) =>
+    `harness 디렉터리 ${harnesses.join("·")} 가 공존 — 사용량 패널을 ${chosen === "claude" ? "Claude Code 토큰" : "Kiro 크레딧"}으로 자동 선택했습니다. 다른 쪽을 보려면 --usage ${chosen === "claude" ? "kiro" : "claude"} 를 지정하세요.`,
+
+  questionsUnclosedBlock: (files) =>
+    `닫히지 않은 코드 블록·주석이 있는 질문 파일 ${files.length}개 — 숨기지 않고 본문으로 읽었습니다(블로커를 감추지 않으려고). 엔진은 다르게 읽을 수 있으니 파일을 확인하세요: ${files.join(", ")}`,
+
+  recordFileUnreadable: (files, questions) =>
+    `기록 경로 ${files.length}곳을 읽거나 확인하지 못했습니다(예: 권한 없음, 파일 자리의 폴더, 끊긴 링크, 따라가지 않는 폴더 링크) — 없는 것으로 치지 않습니다${questions ? ". 질문 파일을 찾는 범위가 포함돼 있어 블로커 목록이 불완전할 수 있습니다" : ""}: ${files.join(", ")}`,
+
+  unitDagMalformed: (reason, detail, stop) =>
+    `inception/units-generation/unit-of-work-dependency.md 의 units 블록을 읽을 수 없습니다(${reason}: ${detail}). ${
+      stop === "construction"
+        ? "다시 쓸 때까지 엔진은 유닛별 Construction stage 에서 멈추므로"
+        : "엔진은 이 블록을 읽을 수 있을 때까지 Units Generation 관문을 열지 않습니다. 그 stage 가 아직 진행 중이면 파일을 쓰는 중일 수 있으므로"
+    }, runtime-graph.json 에 캐시된 유닛 목록으로 대신 그리지 않습니다.`,
+
+  tokenUsageFailed: (detail) => `토큰 사용량 조립 실패 — 사용량 패널만 하락: ${detail}`,
+
+  creditAssemblyFailed: (detail) => `크레딧 조립 실패 — 크레딧 패널만 하락: ${detail}`,
+};
+
+const blockers: BlockerStrings = {
+  staleStage: "이전 stage (파킹된 질문)",
+  confirmation: "게이트 확인",
+  confirmationTip:
+    "승인 관문의 결정 항목입니다 — 엔진이 정한 선택지를 고르거나 수정 요청 사유를 적어야 진행됩니다",
+  loose: "제목 미인식",
+  looseTip:
+    "질문 제목으로 인식하지 못한 자리의 빈 [Answer]: 입니다 — 프로토콜은 제목과 상관없이 빈 태그를 모두 채우라고 하므로, 이 stage 가 진행 중이면 이것도 답을 기다리는 자리입니다",
+  untitled: "(제목 없음)",
+  invalidTags: (tags) => `확인 무효 · [Answer]: ${tags}개`,
+  invalidTagsTip:
+    "요약 확인에는 [Answer]: 가 정확히 하나여야 합니다 — 둘 이상이면 엔진은 어떤 답도 읽지 않으므로, 하나만 남기고 지워야 진행됩니다",
+  viewTip: (rel) => `${rel} 원문을 대시보드에서 보기`,
+};
+
+const KO_ASK: Record<string, string> = {
+  compose: "작업 묶음(compose) 승인",
+  "compose-offer": "작업 묶음 제안 확인",
+  "construction-staffing": "유닛 구현 담당 정하기",
+  "guard-recovery": "가드 복구 방법 선택",
+  "intent-pick": "intent 선택",
+  "legacy-plan-approval-recovery": "계획 승인 복구",
+  "new-work-routing": "새 요청 분류",
+  "plan-approval": "계획 승인",
+  "project-type": "프로젝트 유형 확인",
+  "repo-scope": "분석할 저장소 범위",
+  "scope-confirm": "범위 확인",
+  "team-handover": "팀 인계",
+  "unit-claim": "유닛 선점",
+  "unit-paused": "일시정지된 유닛 재개",
+  "unit-plan-change": "유닛 계획 변경",
+  "units-repos": "유닛 저장소 변경 확인",
+};
+
+const status: StatusStrings = {
+  bannerWaiting: "답변을 기다리고 있어요",
+  bannerMore: (n) => `그 밖에 ${n}건 더 기다리고 있어요`,
+  heroEyeYou: "지금 · 내 차례",
+  heroEyeNow: "지금",
+  heroEyeDone: "완료",
+  heroKind: {
+    question: "질문",
+    confirmation: "확인 요청",
+    loose: "빈 답",
+    gate: "승인",
+    decision: "결정",
+    engineAsk: "엔진 질문",
+    parked: "일시정지",
+    unitPaused: "유닛 일시정지",
+  },
+  heroAge: (sec) => {
+    const d = Math.floor(sec / 86400);
+    const h = Math.floor((sec % 86400) / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    if (d > 0) return h > 0 ? `${d}일 ${h}시간` : `${d}일`;
+    if (h > 0) return m > 0 ? `${h}시간 ${m}분` : `${h}시간`;
+    return `${Math.max(1, m)}분`;
+  },
+  heroAgeCap: "째 기다리는 중",
+  heroCopyPath: "경로 복사",
+  heroCopied: "복사했어요",
+  heroOpen: "열기",
+  heroAnswerInChat: "질문 파일이 없는 질문이에요 — 대화창에서 답하세요",
+  bannerOpenFile: "질문 파일 열기",
+  bannerIncomplete: "읽지 못한 질문 파일이 있어요",
+  bannerIncompleteSub: "그 안에 답할 질문이 있는지는 알 수 없어요 — 경로는 아래 경고에 있어요",
+  bannerIncompleteNote: "읽지 못한 질문 파일이 있어 건수가 정확하지 않을 수 있어요",
+  bannerClear: "지금 기다리는 답변은 없어요",
+  bannerDone: "이 run 은 끝났어요",
+  bannerDoneLoose: (n) => `답하지 않은 질문 ${n}개가 남아 있어요`,
+  bannerUnknown: "run 상태를 읽지 못했어요",
+  runComplete: "✓ 완료",
+  runUnknown: "? run 상태 확인 불가",
+  runSource: "state.md",
+  running: "▶ 진행 중",
+  runningSub: (stage, age) => `${stage} · 마지막 기록 ${age} 전`,
+  runTip:
+    "마지막 기록은 감사 로그의 가장 최근 이벤트입니다. 이 값이 계속 커지면 run 이 아무것도 쓰지 않고 있다는 뜻입니다",
+  runTipPartial: (refused) =>
+    `마지막 기록은 읽은 감사 기록의 가장 최근 이벤트입니다 — 감사 기록 경로 ${refused}곳을 읽지 않아, 이 값이 커져도 run 이 쓰기를 멈췄다고 볼 수 없습니다`,
+  runningUnit: (unit) => `유닛 ${unit}`,
+  runUnverified: "위치 미확인",
+  runConflict: (where) => `엔진 지시는 ${where}`,
+  runOffRoster: (unit, why) =>
+    why === "absent" ? `유닛 ${unit} 은 유닛 목록에 없음` : "유닛 목록을 읽을 수 없음",
+  runOffRosterTip:
+    "state.md 의 유닛 위치(Active Unit)는 캐시입니다. 엔진은 unit-of-work-dependency.md 에 있는 유닛만 진행하고, 진행 중인 유닛도 그 안에서만 이어 가므로, 목록에 없는 유닛이나 읽을 수 없는 목록으로는 위치를 확인할 수 없습니다",
+  runConflictTip:
+    "state.md 의 유닛 위치(Unit Stage·Active Unit)와 지금 state 에 맞는 엔진 지시(active-directive.json)가 서로 다른 곳을 가리킵니다. 둘 다 엔진의 라우팅 근거가 아니라 어느 쪽이 맞는지 이 대시보드는 판정하지 않습니다",
+  runUnverifiedTip:
+    "unit-major 에서는 Current Stage 가 첫 per-unit stage 에 머무르므로 실제 위치가 더 뒤일 수 있습니다. state.md 의 Unit Stage 도, 지금 state 에 맞는 엔진 지시(active-directive.json)도 없어 Current Stage 로 표시했습니다",
+  stuckNoRecord: "차단 기록 없음",
+  stuckClear: "✓ 막힘 없음",
+  stuckEarlier: (stage) => `마지막 차단은 ${stage} · 이 clone`,
+  stuckStateChanged: "마지막 차단 이후 state 가 바뀜 — 그 뒤로 차단 없음",
+  stuckNudged: "한 번 재촉함 — 진행 후 첫 차단",
+  stuckBlocked: (count, cap) => `⚠ 진행 없이 ${count}회 연속 차단 기록 (기본 한도 ${cap})`,
+  stuckReleased: (count, cap) =>
+    `⚠ 차단 ${count}회 기록 — 기본 한도 ${cap} 에 닿아 hook 이 멈춤을 허용했을 수 있음`,
+  stuckSource: "stop hook · 이 clone",
+  stuckTip: (cap, autonomous) =>
+    `stop hook 의 block-count.json 입니다. 진행한 뒤 처음 막으면 1, 진행 없이 다시 막을 때마다 1 씩 오르고, 완료·알림·일시정지 때만 0 이 됩니다. 한도에 닿으면 hook 이 더 막지 않고 멈춤을 허용합니다. 한도는 ${autonomous ? "자율" : "대화형"} 기본값 ${cap} 기준이며 CLAUDE_CODE_STOP_HOOK_BLOCK_CAP 으로 바뀌었을 수 있습니다`,
+  humanGate: (stage) => `승인 대기 ${stage}`,
+  humanGateSource: "게이트 열림 · state.md [?]",
+  humanRevising: (stage) => `${stage} 수정 구간 — 게이트가 거절됨`,
+  humanRevisingTip:
+    "사용자가 승인 게이트를 거절했습니다(state.md [R]). 이 구간에는 무엇을 고칠지 묻는 단계와 고치는 단계가 함께 들어 있어, 이 행만으로는 다음 차례가 누구인지 알 수 없습니다. 그래서 답변 대기로 세지 않습니다",
+  humanParked: (stage, byPerson) => `⏸ 일시정지 — ${stage}${byPerson ? " · 사람이 세움" : ""}`,
+  humanParkedTip: "run 이 park 되었습니다. 엔진에 resume 을 요청해야 다시 진행합니다",
+  humanStateSource: "state.md · Runtime State",
+  humanUnitPaused: (unit, reason) => `⏸ 유닛 ${unit} 일시정지${reason ? ` — ${reason}` : ""}`,
+  humanUnitNext: (next) => `다음 행동: ${next}`,
+  humanUnitCacheLeftover: (unit, stage, paused) =>
+    `유닛 ${unit}${stage ? ` (${stage})` : ""}${paused ? " 일시정지" : ""} 기록은 남은 값입니다 — 이 계획에는 유닛이 없습니다`,
+  humanUnitCacheLeftoverTip:
+    "이 계획은 Units Generation 을 건너뛰므로, 엔진은 유닛별 stage 를 stage 단위로 한 번 실행하고 유닛 시작·일시정지·완료를 거부합니다. 이 방식에서는 state 의 Active Unit / Unit Stage 를 쓰는 단계가 없고, stop hook 도 이 값을 읽지 않습니다. 무엇을 기다리는지는 Current Stage 와 엔진의 현재 지시로 정해집니다.",
+  humanEngineAsk: (askType, where) =>
+    `엔진 질문 대기 — ${askType ? (KO_ASK[askType] ?? askType) : "질문"} · ${where}`,
+  humanEngineAskSource: "active-directive.json",
+  humanEngineAskTip:
+    "엔진이 마지막으로 내준 지시가 사람에게 묻는 질문입니다. 지금 state 와 digest 가 맞는 지시만 읽으며, 대부분 질문 파일 없이 대화로만 묻습니다",
+  humanUnreadable: (n) => `읽지 못한 질문 경로 ${n}곳 — 그 안의 질문은 세지 않았습니다`,
+  humanUnreadableTip:
+    "읽거나 확인하지 못했습니다(예: 권한 없음, 파일 자리의 폴더, 끊긴 링크, 따라가지 않는 폴더 링크). 그 안의 빈 답은 빠지고, 그 파일이 설명했을 엔진 질문은 따로 셀 수 있어서 위 수는 어느 쪽으로든 불완전합니다. 경로는 페이지 위 경고에 있습니다",
+  humanTeamGate: (unit, stage) => `유닛 승인 대기 ${unit} · ${stage}`,
+  humanTeamGateRevising: (unit, stage) => `${unit} · ${stage} 다시 열림 — 수정 중`,
+  humanTeamGateSource: "팀 유닛 게이트 · 감사 기록",
+  humanTeamGateTip:
+    "팀 소유에서는 유닛 게이트가 state 행을 바꾸지 않습니다. 그래서 stop hook 과 같은 방식으로 감사 기록에서 읽습니다: 진행 중인 유닛과 stage, 게이트 범위(scope stamp 의 값, 없으면 Unit Gate Rhythm), 그리고 이 checkout 의 claim 시도에 속한 기록만 봅니다",
+  humanTeamGateUnread: "팀 유닛 게이트 — 판독하지 못함",
+  humanTeamGateUnreadTip:
+    "팀 소유에서는 유닛 게이트를 감사 기록의 유닛·게이트 범위·claim 시도로 판정합니다. 이 checkout 에서 claim 시도를 정하려면 intent 목록(intents.json)이 필요한데, 엔진도 읽지 못하는 모양이라 승인 대기 여부를 판정하지 않았습니다 — '대기 없음'이라는 뜻이 아닙니다",
+  humanCheckoutPark: "이 checkout 에 유닛 park 표시 — 적용 범위 미확인",
+  humanCheckoutParkTip:
+    "aidlc/.aidlc-unit-parked 가 있습니다. 이 park 가 지금 보는 intent 에 적용되는지는 scope stamp 로 정해지는데 이 대시보드는 그것을 확인하지 않아, 대기 건수에 넣지 않았습니다",
+  humanDecision: (checkpoint, decision) =>
+    `결정 대기 — ${[checkpoint, decision].filter(Boolean).join(": ") || "이름 없는 결정"}`,
+  humanDecisionSource: "감사 로그 · DECISION_RECORDED",
+  humanDecisionUnscoped: "범위 미확인 — state 의 유닛 위치로만 정함",
+  humanDecisionTip:
+    "질문 파일 없이 감사 로그로 연 결정입니다(학습 항목 선택, 추가할 것, 유닛·배치 승인 등). 엔진은 이것을 닫는 기록이 남을 때까지 사람의 답을 기다립니다",
+  humanGateReplied: (stage, unit) =>
+    `${unit ? `${unit} · ${stage}` : stage} 승인에 답함 — 아직 기록 안 됨`,
+  humanGateRepliedTip:
+    "게이트가 열린 뒤 사람이 답했습니다(그 게이트를 띄운 clone 의 감사 기록에 답 턴이 있음). 2.11.4 엔진은 이때를 사람 차례가 아니라, 에이전트가 승인·거절을 기록할 차례로 봅니다. 엔진은 자기 clone 의 기록을 보는데 커밋된 트리에는 그런 clone 이 없어서, 게이트를 띄운 clone 의 기록으로 대신 판단합니다. 대기 건수에 넣지 않습니다",
+  humanDecisionUnlessUnattended:
+    "무인 실행(AIDLC_UNATTENDED=1)이 아니면 대기 — 실행 환경은 기록에 없음",
+  humanTurnEnded: "엔진이 턴을 끝냄 — 다음 말은 사람 차례",
+  humanTurnEndedTip:
+    "엔진의 마지막 지시가 질문이나 멈춤 안내였습니다(.aidlc-engine/turn-end 가 human-turn 보다 새로움). 답할 질문이 있으면 위의 엔진 질문 행에 나오며, 이 행 자체는 대기 건수에 넣지 않습니다",
+  humanHooksStale: (hb, ev) =>
+    `⚠ hook 이 멈춘 듯함 — 마지막 발화 ${hb} 전, 마지막 stage·게이트 기록 ${ev} 전`,
+  humanHooksNever: "⚠ hook 발화 기록 없음 — stage·게이트 기록은 있음",
+  humanHooksStaleTip:
+    "가장 최근 hook 발화가 가장 최근 STAGE_/GATE_ 기록보다 5분 넘게 뒤처졌습니다(엔진 hookLiveness 와 같은 비교). 2.11 은 이 상태에서 계획 승인 결정 기록(aidlc-log decision --checkpoint plan-approval)을 거부하니, 하네스의 hook 등록을 확인하세요",
+  humanHooksNeverTip:
+    "hooks-health 에 .last 파일이 하나도 없는데 STAGE_/GATE_ 기록은 있습니다. hook 이 등록되지 않았거나 이 clone 에서 돌지 않았을 수 있습니다",
+  humanAutonomous: "자율 모드 — 질문 파일의 빈 답은 런을 붙잡지 않음",
+  humanAutonomousTip:
+    "Construction Autonomy Mode 가 autonomous 입니다. 질문 파일의 빈 답으로는 unit-major 의 계획 승인만 런을 멈춥니다. 감사 로그로 연 결정과 작업 묶음 승인은 사람이 있으면 그대로 기다리고, 무인 실행(AIDLC_UNATTENDED=1)일 때만 기다리지 않습니다(2.11.4)",
+  humanEngineOnly: (file) => `엔진만 대기로 보는 빈 태그 · ${file}`,
+  humanEngineOnlyTip:
+    "stop hook 은 진행 중 stage 의 질문 파일 원문에서 빈 [Answer]: 를 찾으면 턴 종료를 허용합니다. 이 대시보드가 답한 것으로 읽은 자리(코드 블록 속 예시, 다른 절에서 답한 자리 등)이므로 답변 대기로 세지 않지만, 엔진이 여기서 멈출 수 있습니다",
+  humanNone: "✓ 답변 대기 없음",
+  humanSource: "questions 파일 · state · 감사 기록 · 엔진 마커",
+  checksNone: "현재 stage 검사 기록 없음",
+  checksNonePartial: (refused) =>
+    `읽은 감사 기록에는 현재 stage 검사 기록 없음 — 감사 기록 경로 ${refused}곳을 읽지 않아 그쪽 기록은 보이지 않습니다`,
+  checksInFlight: (pending) => `⋯ 검사 진행 중 ${pending}건`,
+  checksFailed: (failed) => `✗ 검사 실패 ${failed}건 기록`,
+  checksPassed: (passed) => `✓ 검사 통과 ${passed}건`,
+  checksPassedPartial: (passed, refused) =>
+    `✓ 읽은 감사 기록에서 검사 통과 ${passed}건 — 읽지 않은 경로 ${refused}곳에 실패가 있을 수 있습니다`,
+  checksSource: (stage) => `sensor · ${stage} (Current Stage) · 감사 로그`,
+  checksUnverified: (n) => `? 검증된 결과가 없는 검사 ${n}건`,
+  checksUnverifiedTip:
+    "Note 가 붙은 통과(도구 없음, 스크립트 오류, 결과를 기록하지 못함) 또는 예산 초과 처리로, 이후 같은 출력에 대한 검증된 통과가 없는 것입니다. 차단 관문은 둘 다 실패처럼 거부하므로 통과로 세지 않습니다",
+  checksFailedTip:
+    "현재 stage 에서 기록된 sensor 실패 중, 같은 출력에 대한 이후의 검증된 통과로 해소되지 않은 것입니다. 관문은 sensor 를 다시 실행하므로, 관문의 판정을 미리 말하는 것이 아니라 기록된 내용입니다",
+  errorsNone: "실패한 엔진 명령 기록 없음",
+  errorsNonePartial: (refused) =>
+    `읽은 감사 기록에는 실패한 엔진 명령 없음 — 감사 기록 경로 ${refused}곳을 읽지 않아 그쪽 기록은 보이지 않습니다`,
+  errorsFollowed: "그 뒤 기록 있음",
+  errorsErrorsOnly: "그 뒤로는 오류 기록뿐",
+  errorsStageClosed: "그 단계는 나중에 완료됨",
+  errorsDelivered: "stop hook 이 전달하고 턴을 이어가게 함",
+  errorsAfterStage: (stage, unit, latest) =>
+    `${latest ? "최근 발생: " : ""}${unit ? `${stage} / ${unit}` : stage} 활동 뒤 (추정)`,
+  errorsTip: (count, first, last, shard) =>
+    count > 1
+      ? `${count}회 · 처음 ${first} · 마지막 ${last} (UTC) · clone ${shard}`
+      : `${last} (UTC) · clone ${shard}`,
+  errorsViewTip: (ts) => `감사 기록 원문 열기 — 이 기록은 ${ts} 에 있습니다`,
+  errorsHelpDropped: (n) =>
+    `옛 엔진이 오류로 남긴 도움말(--help) 호출 ${n}건은 뺐습니다 — 지금 엔진은 오류로 치지 않습니다`,
+  errorsSource:
+    "감사 로그 · ERROR_LOGGED 는 엔진 도구가 실패하면 남는 기록이고, 해결했다는 기록은 따로 없습니다. 거절은 엔진이 에이전트 자신의 호출을 막은 것이며, 단계는 같은 clone 의 앞선 기록으로 추정합니다",
+};
+
+const overview: OverviewStrings = {
+  sectionProgress: "진행 개요",
+  planLabel: (name) => `계획: ${name}`,
+  sectionUnitProgress: "유닛 진행 (state.md 권위)",
+  sectionMatrix: "Construction 유닛 매트릭스",
+  runComplete: "완료",
+  nowLabel: "현재",
+  updatedLabel: "갱신",
+  kindArtifact: "산출물",
+  kindQuestions: "질문/응답",
+  kindDiary: "stage 일지",
+  openInEditor: (rel) => `${rel} — 기본 편집기로 열기`,
+  provisionalTip: "진행 중 — 수치는 계속 늘어남",
+  totalColumn: "계",
+  unassignedOwner: "미배정",
+  batchNote: "배치 안의 유닛은 병렬 가능 — 의존 순서대로 묶인 위상 배치.",
+  unitProgressNote:
+    "state.md 의 <code>## Unit Progress</code> — 엔진이 수령증·리뷰·게이트를 반영해 매 <code>next</code> 마다 다시 쓰는\n  <b>권위 있는 값</b>입니다. 손으로 고친 내용은 라우팅·완료 근거가 되지 않습니다. 아래 매트릭스는 디스크에서 재구성한 별개의 진단입니다.",
+  unitProgressStaleRoster: (missing, extra, rewritesOnNext) =>
+    `이 표는 엔진이 다시 만들 때 쓰는 유닛 목록과 맞지 않습니다(${[
+      missing.length ? `표에 없는 유닛: ${missing.join(", ")}` : "",
+      extra.length ? `목록에 없는 행: ${extra.join(", ")}` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ")}). 마지막으로 쓰인 표이며, ${
+      rewritesOnNext
+        ? "엔진은 다음 `next` 에서 다시 씁니다"
+        : "stage 단위 실행에서는 `next` 가 이 표를 다시 쓰지 않습니다"
+    }.`,
+  unitProgressStaleDag:
+    "유닛 목록(unit-of-work-dependency.md)을 읽을 수 없어 엔진이 이 표를 다시 만들지 못합니다 — 보이는 것은 마지막으로 쓰인 표이지 지금의 권위 있는 값이 아닙니다.",
+  sectionUnitProgressStageLevel: "유닛 진행 (state.md — 이 계획은 stage 단위로 실행)",
+  unitProgressStageLevelNote:
+    "state.md 의 <code>## Unit Progress</code> 입니다. 이 계획은 Units Generation 을 건너뛰므로 엔진은 유닛별 stage 를 stage 단위로 한 번 실행하고, 그때는 이 표를 따라 유닛을 순회하지 않습니다. 유닛 claim 처럼 다른 곳에서는 여전히 이 표를 읽을 수 있습니다.",
+  noUnits: "유닛 정보 없음 — units-generation 미진입.",
+  noUnitsPill: "해당 없음",
+  stageLevelUnits:
+    "유닛별 매트릭스 없음 — 이 계획은 Units Generation 을 건너뛰므로 유닛이 없습니다. 유닛별 Construction stage 는 stage 단위로 한 번 실행되고, 산출물은 construction/<stage>/ 에 씁니다(위 Phase · Stage 참고).",
+  stageLevelUnitsPill: "stage 단위",
+  unitModeUnknown:
+    "state 파일과 scope grid 어디에서도 Units Generation 의 실행 여부를 읽지 못해, 이 매트릭스는 산출물이 유닛별로 있다고 가정하고 그렸습니다.",
+  unitDagMalformed: (reason, stop) =>
+    `유닛별 매트릭스 없음 — 엔진이 unit-of-work-dependency.md 의 units 블록을 읽지 못해(${reason}) 다시 쓸 때까지 유닛 목록을 알 수 없습니다${
+      stop === "construction" ? "" : "(Units Generation 이 아직 진행 중이라 쓰는 중일 수 있습니다)"
+    }. runtime graph 에 캐시된 목록으로 대신 그리지 않습니다.`,
+  unitDagMalformedPill: (stop) => (stop === "construction" ? "막힘" : "아직 읽을 수 없음"),
+  unitDagHealed:
+    "유닛 목록은 엔진처럼 unit-of-work-dependency.md 에서 읽었습니다 — runtime-graph.json 에 캐시된 목록은 이 파일과 배치 또는 유닛 kind 가 달라, 엔진도 그 캐시를 쓰지 않습니다.",
+
+  tipPartial: (missing) => `미완: ${missing.join(", ")}`,
+  tipComplete: (present) => `완료: ${present.join(", ")}`,
+  tipUnsettled: (present) =>
+    `산출물은 다 있으나 완료 수령증(UNIT_COMPLETED)이 없습니다 — 일시중지·재개 대기·미승인 상태일 수 있습니다 (파일: ${present.join(", ")})`,
+  tipUnverified: (reason, present) =>
+    `${RECEIPT_REASON_KO[reason]}${present.length ? ` (파일: ${present.join(", ")})` : ""}`,
+  tipNotApplicable: (present) =>
+    `이 유닛 kind 에 계약된 산출물 없음${present.length ? ` (있는 파일: ${present.join(", ")})` : ""}`,
+  tipSkipped: (reason) =>
+    `엔진이 이 유닛의 이 stage 를 건너뛰었습니다(UNIT_SKIPPED)${reason ? ` — 사유: ${reason}` : ""}`,
+  tipNotStarted: "미착수",
+
+  legendBase:
+    "█ 완료(수령증을 쓰는 stage 는 수령증 확인, 아니면 산출물 기준) · ▨ 착수했으나 산출물 미완(칸에 마우스를 올리면 무엇이 빠졌는지 표시) · · 미착수",
+  legendUnsettled:
+    " · ▩ 산출물은 다 있으나 완료 수령증(UNIT_COMPLETED) 없음 — 엔진도 이 유닛을 미완으로 봅니다",
+  legendUnverified:
+    " · ▤ 완료 수령증을 감사 기록만으로 확인할 수 없음 — 미완이라고 판정된 것은 아닙니다 (칸에 마우스를 올려 이유 확인)",
+  legendNa: " · – 이 유닛 kind 에 계약된 산출물 없음(계 열의 괄호는 그 수)",
+  legendSkipped: " · ⊘ 엔진이 이 유닛의 stage 를 건너뜀(UNIT_SKIPPED) — 분모에서 뺌",
+  legendUnverifiedContract:
+    "state.md 와 harness 의 State Version 을 대조하지 못해 <b>확인되지 않은 계약</b>입니다 — 계약 내용은 그대로 보여주지만, 엔진과 같은 완료 판정이라고 보증하지 않습니다",
+  legendNoContract: (receiptAware) =>
+    `stage-graph.json 부재로 계약 판정 불가 — 칸은 파일 유무${receiptAware ? "와 완료 수령증" : ""}만 뜻함`,
+
+  checkpointHeading: "체크포인트 검증",
+  checkpointNote:
+    "유닛마다 남는 체크포인트 증명 파일을 읽은 결과입니다. 증명이 이 상태인 동안 엔진은 체크포인트를 검증된 것으로 셀 수 없어, 검증이 통과하기 전에는 그 유닛의 새 승인을 묻지도 기록하지도 않습니다. 이것으로 정해지지 않는 두 가지는 이 페이지도 말하지 않습니다 — 유닛이 이미 받은 승인이 유지되는지(범위를 바꾼 뒤에도 유지될 수 있습니다)와 다음에 무엇을 해야 하는지입니다. 엔진이 이 일로 사람에게 묻지 않으므로 대기로 세지 않습니다. 통과한 증명은 적지 않습니다 — 아직 유효한지는 이 페이지가 재현하지 않는 fingerprint 에 달려 있습니다.",
+  checkpointIndefiniteNote:
+    "? 표시는 이 리더가 판정하지 못한 항목입니다 — 엔진이 읽는 파일이 아닐 수 있거나 여기서 파일을 읽지 못했으므로, 엔진의 판정이라고 주장하지 않습니다.",
+  checkpointKind: (kind) =>
+    kind === "skeleton" ? "walking-skeleton 체크포인트" : "유닛 체크포인트",
+  checkpointFailed: (unit, kind, detail, startedAt) =>
+    `${unit} — ${kind}: 검증이 통과하지 않았습니다 (${detail}), 실행 ${startedAt}`,
+  checkpointFault: (fault, exitCode, signal) =>
+    fault === "exit-code"
+      ? exitCode === null
+        ? "종료 코드 없음"
+        : `종료 코드 ${exitCode}`
+      : fault === "signal"
+        ? `시그널 ${signal ?? "?"}`
+        : fault === "error"
+          ? "검사를 실행하지 못함"
+          : fault === "evidence-changed"
+            ? "실행 중에 유닛의 근거가 바뀜"
+            : fault === "unfinished"
+              ? "끝나지 않음"
+              : fault === "not-verified"
+                ? "검증되지 않음"
+                : fault === "wrong-unit"
+                  ? "증명이 다른 유닛을 가리킴"
+                  : "증명이 다른 종류의 체크포인트 것임",
+  checkpointMalformed: (unit, kind) =>
+    `${unit} — ${kind}: 엔진이 받아들이지 않는 증명 파일입니다(파싱 불가이거나 필드 형식이 다름). 엔진은 증명이 없는 것으로 읽고, 파일이 있으므로 커밋된 검증 기록으로 대신하지도 않습니다`,
+  checkpointUnreadable: (unit, kind, cause) =>
+    `${unit} — ${kind}: 증명을 읽지 못했습니다 (${
+      cause === "link"
+        ? "경로에 심볼릭 링크가 있음 — 엔진은 이를 거부하고 오류로 멈춥니다"
+        : cause === "hardlink"
+          ? "하드링크임 — 엔진은 이를 거부하고 오류로 멈춥니다"
+          : cause === "not-file"
+            ? "일반 파일이 아님 — 엔진은 이를 거부하고 오류로 멈춥니다"
+            : cause === "too-large"
+              ? "이 리더의 1MB 한도를 넘음"
+              : cause === "changed"
+                ? "읽는 동안 파일이 바뀜 — 다음 새로고침에서 다시 읽습니다"
+                : "읽기 오류 — 엔진도 이 파일에서 오류로 멈춥니다"
+    })`,
+  checkpointKindUndetermined:
+    "Skeleton Stance 가 scope-dependent 이고(또는 그래프에 배치가 없고) 이 페이지는 scope 파일을 읽지 않아, skeleton 유닛의 증명 두 개를 모두 확인합니다 — 엔진이 읽는 것은 그중 하나뿐입니다.",
+  checkpointOutputTail: "출력 끝부분",
+};
+
+const page: PageStrings = {
+  warningsHeading: "읽기 경고",
+  harnessNotFound: "미검출",
+  pickFolder: "📁 폴더 변경",
+  wsMenuTip: "다른 워크스페이스로 바꾸기",
+  wsHeading: "워크스페이스",
+  wsNoOthers: "다른 워크스페이스를 찾지 못했습니다.",
+  wsLoading: "워크스페이스를 찾는 중…",
+  wsLoadFailed: "목록을 불러오지 못했습니다",
+  wsCurrent: "현재",
+  wsTruncated: "검색 한도까지만 찾았습니다. 목록에 없으면 폴더 찾아보기를 쓰세요.",
+  reloadTitle: "지금 다시 읽기 (r) — SKIP↔EXECUTE 변경처럼 폴링이 놓칠 수 있는 수정을 즉시 반영",
+  reloadLabel: "새로고침",
+  footer: "읽기 전용 — 이 대시보드는 워크스페이스에 쓰지 않음.",
+  langGroupLabel: "화면 언어 선택",
+  langKo: "한국어",
+  langEn: "English",
+  notifyOff: "알림 꺼짐",
+  notifyOn: "알림 켜짐",
+  notifyBlocked: "알림 차단됨",
+  notifyUnsupported: "알림 미지원",
+  notifyOffTip:
+    "새로 기다리는 것이 생기거나 run 이 끝나면 데스크톱 알림으로 알려 드려요. 누르면 켜져요.",
+  notifyOnTip:
+    "켜져 있어요. 이 탭을 보고 있지 않을 때만 울리고, 탭이 가려져 있어도 계속 확인해요. 알림이 오지 않으면 운영체제 알림 설정에서 이 브라우저의 알림을 켜 주세요(macOS 는 같은 이름의 항목 두 개를 모두). 누르면 꺼져요.",
+  notifyBlockedTip:
+    "브라우저가 이 페이지의 알림을 막고 있어요. 주소창의 사이트 정보에서 알림을 허용한 뒤 다시 누르세요.",
+  notifyUnsupportedTip: "이 브라우저는 데스크톱 알림을 지원하지 않아요.",
+
+  jsReloading: "새로고침 중",
+  jsRefreshedPrefix: "갱신 ",
+  jsRefreshFailed: "갱신 실패 — 재시도 중",
+  jsOpenFailedStatus: "열기 실패 ({status})",
+  jsOpenFailedUnreachable: "열기 실패 — 서버에 닿지 못했다",
+  jsNotifyWaitBody: "{name} · 기다리는 것 {n}건",
+  jsNotifyMore: " (새로 온 것 외 {n}건)",
+  jsNotifyOnTitle: "알림을 켰어요",
+  jsNotifyOnBody:
+    "{name} 에 새로 기다리는 것이 생기거나 run 이 끝나면 알려 드려요. 이 탭을 보고 있을 때는 울리지 않아요.",
+};
+
+const health: HealthStrings = {
+  sectionDiary: "결정과 이슈",
+  sectionStream: "감사 원장",
+  kindDeviation: "계획 변경",
+  kindDeviationTip: "실행 중 원래 계획에서 달라진 내용과 그 이유를 기록한 항목",
+  kindTradeoff: "선택 근거",
+  kindTradeoffTip: "여러 대안 사이에서 무엇을 얻고 포기하며 선택했는지 기록한 항목",
+  kindInterpretation: "해석",
+  kindInterpretationTip: "모호한 요구나 지시를 어떤 의미로 이해했는지 기록한 항목",
+  kindResolved: "해결됨",
+  kindResolvedTip: "이전에 열린 질문이나 이슈가 해결되었음을 표시한 항목",
+  kindFollowUp: "후속 확인",
+  kindFollowUpTip: "아직 확인하거나 결정해야 할 작업이 남은 항목",
+  kindNote: "참고",
+  kindNoteTip: "열린 질문이지만 후속 조치나 해결 여부가 명시되지 않은 항목",
+  sourceLink: "원문",
+  openTip: (rel) => `${rel} 열기`,
+  noRecords: "기록 없음.",
+  more: (count) => `나머지 ${count}건`,
+  stageRollup: (count) => `Stage별 전체 기록 · 정규화 ${count}건`,
+  colStage: "stage",
+  colDecision: "결정",
+  colDeviation: "변경",
+  colFollowUp: "후속",
+  colResolved: "해결",
+  colNote: "참고",
+  colTotal: "계",
+  noDiaryFiles: "stage 일지(memory.md) 없음.",
+  noDiaryRecords: "기록된 결정이나 후속 이슈 없음.",
+  statFollowUp: "후속 확인",
+  statResolved: "해결 기록",
+  statDeviation: "계획 변경",
+  statDecision: "결정 근거",
+  tidyPill: "정리됨",
+  tidyPillTip: "해결 표시 없이 남아 있는 후속 확인 후보가 없음을 의미",
+  tidyNote: "해결 표시 없이 남은 후속 후보 없음.",
+  headingFollowUp: "후속 확인 후보",
+  headingRecentDecisions: "최근 결정",
+  headingRecentDeviations: "최근 계획 변경",
+  resolvedRecords: (count) => `해결 기록 ${count}건`,
+  emptyLedger: "감사 기록 비어 있음.",
+  filterLabel: "종류",
+  filterAll: (total) => `전체 (${total}건)`,
+  streamMeta: (shown, total, shards) =>
+    `최근 ${shown}건 표시 · 전체 ${total}건 · shard ${shards}개`,
+  colTime: "시각",
+  colEvent: "이벤트",
+  colStageUnit: "stage / unit",
+  colDetail: "내용",
+};
+
+const deferrals: DeferralStrings = {
+  section: "미뤄둔 결정",
+  faces: {
+    passed: {
+      label: "지난 단계",
+      tip: "이 결정을 맡기로 한 단계가 이미 끝났습니다. 답이 기록된 흔적은 없습니다 — 엔진이 닫힘 표시를 쓰지 않으므로 '버려졌다'가 아니라 '보이지 않는다'는 뜻입니다",
+    },
+    current: {
+      label: "현재 단계",
+      tip: "지금 진행 중인 단계에 배정된 기록입니다 — 규약상 이 단계의 작업에 필요할 때 다시 묻습니다",
+    },
+    ahead: {
+      label: "예정 단계",
+      tip: "아직 끝나지 않은 단계에 배정된 기록입니다 — 규약상 그 단계의 작업에 필요할 때 다시 묻습니다",
+    },
+    outOfScope: {
+      label: "범위 밖 단계",
+      tip: "실재하는 단계지만 이번 실행 범위(state.md)에 없습니다 — 아무도 물어보지 않습니다",
+    },
+    nextCycle: { label: "다음 차수", tip: "이번 차수 밖으로 명시적으로 밀어낸 항목" },
+    unassigned: {
+      label: "배정 없음",
+      tip: "배정 칸에서 단계를 읽어낼 수 없습니다 — 물어볼 자리가 정해지지 않았으므로 다음 단계에서 사라질 수 있습니다",
+    },
+  },
+  ageTip: "이 항목이 처음 기록된 뒤 지난 시간",
+  sourceLink: "원문",
+  viewTip: (rel) => `${rel} 원문을 대시보드에서 보기`,
+  editorLink: "에디터",
+  openTip: (rel) => `${rel} 열기`,
+  assignLabel: "배정",
+  noneApplicable: "해당 없음.",
+  more: (key, count) => `${key} 나머지 ${count}건`,
+  ownerRollup: (stages) => `배정된 자리별 집계 · stage ${stages}곳`,
+  colOwner: "배정된 자리",
+  colStatus: "상태",
+  colCount: "건수",
+  assumptionPill: "전제",
+  assumptionPillTip: "확인되지 않은 채로 다음 단계에 넘어간 전제 — 배정된 자리가 없습니다",
+  assumptionSummary: (count) => `확인되지 않은 전제 ${count}건 — 배정 없음`,
+  assumptionNote: `엔진의 stage 규약은 전제를 <code>[assumption]</code>으로 표시하고, 사용자가 그 단계의 질문지에서
+  확인해 줄 때까지 하류 산출물에서도 전제로 남기라고 정합니다. 표가 아니라 산문이라 배정된 자리가 없어
+  이 대시보드도 어디서 청구될지 말할 수 없습니다 — 산문에서 단계 이름을 추측하지 않습니다.`,
+  diaryFollowUpPill: "후속 확인",
+  diaryFollowUpTip: "문장 자체가 후속 확인·결정을 요구합니다",
+  diaryNotePill: "일지 미결",
+  diaryNoteTip:
+    "stage 가 미결 소절에 적었지만 문장에 후속 신호는 없습니다 — 소절 자체가 미결 선언이라 그대로 셉니다",
+  diarySummary: (count) => `stage 일지의 미결 ${count}건 — 배정 없음`,
+  diaryNote: (resolved) =>
+    `산출물이 아니라 <code>memory.md</code>의 <code>## Open questions</code>에서 읽었습니다 —
+  엔진이 모든 stage 일지에 두라고 정한 두 번째 미결 대장입니다. 오케스트레이터가 스스로 적은 메모라
+  하류 단계와의 계약이 아니고 배정 칸도 없어서, 위 산출물 미결과 <b>합산하지 않습니다</b>.${
+    resolved > 0 ? ` 해소 표시가 붙은 ${resolved}건은 제외했습니다.` : ""
+  }`,
+  ledgerItems: "산출물 미결",
+  ledgerItemsSource: "<code>## Assumptions &amp; Open Questions</code>의 미결 항목",
+  ledgerAssumptions: "확인되지 않은 전제",
+  ledgerAssumptionsSource: "같은 절의 <code>[assumption]</code> 항목",
+  ledgerDiary: "stage 일지 미결",
+  ledgerDiarySource: "각 stage <code>memory.md</code>의 <code>## Open questions</code>",
+  ledgerDeclared: "stage 선언 미결 질문",
+  ledgerDeclaredSource:
+    "<code>requirements.md</code>·<code>contract-summary.md</code>의 <code>Open questions</code>",
+  declaredFaces: {
+    requirements: {
+      label: "요구사항",
+      tip: "requirements-analysis 가 직접 적은 Open questions — 이후 단계로 넘긴 남은 불확실성",
+    },
+    contract: {
+      label: "계약",
+      tip: "contract-design 의 Open questions 표 — 풀리지 않은 계약 지점과 그것이 막는 대상",
+    },
+  },
+  declaredSummary: (count) => `stage 산출물이 직접 선언한 미결 질문 ${count}건 — 배정 없음`,
+  declaredNote: `requirements-analysis(<code>requirements.md</code>)와 contract-design(<code>contract-summary.md</code>)이
+  쓰도록 정해진 <code>Open questions</code>에서 읽었습니다 — <code>## Assumptions &amp; Open Questions</code> 절 밖입니다.
+  둘 다 배정 칸이 없습니다. <code>Blocks</code>는 그 지점이 막는 대상이지 답할 단계가 아니므로
+  <b>담당을 주장하지 않고, 위의 산출물 미결과 합산하지 않습니다</b>.`,
+  contractLabel: "계약",
+  blocksLabel: "막는 대상",
+  declaredUnread: (files) =>
+    `${files}의 <code>Open questions</code> 절은 이 리더가 아는 모양이 아닙니다 —
+    <b>비어 있다는 뜻이 아니라 읽지 못했다는 뜻입니다</b>.`,
+  declaredMissing: (files) =>
+    `${files}에서 이 리더가 알아보는 <code>Open questions</code> 절을 찾지 못했습니다 — 그 stage 규약은 이 절을
+    쓰라고 정하지만 제목 모양은 정하지 않으므로, 이 리더가 모르는 모양으로 적혀 있을 수 있습니다.`,
+  declaredUnreadable: (files) =>
+    `${files}는 있지만 파일로 읽을 수 없습니다 — <b>그 안의 미결 질문은 읽지 못했습니다</b>.`,
+  aoqUnreadable: (files) =>
+    `${files}를 읽거나 확인하지 못했습니다 — <b>그 안에 <code>## Assumptions &amp; Open Questions</code> 절이 있다면 위 숫자에 들어 있지 않습니다</b>.`,
+  diaryUnreadable: (files) =>
+    `stage 일지 경로 ${files}를 읽거나 확인하지 못했습니다 — <b>그 안의 미결 질문은 읽지 못했습니다</b>.`,
+  unreadAlongside: (unread, files) =>
+    `<b><code>## Assumptions &amp; Open Questions</code> 절 ${unread}곳은 이 리더가 아는 모양이 아닙니다</b>
+    (${files}) — 그 안의 미결은 위 숫자에 들어 있지 않습니다.`,
+  chipUnassignedTip:
+    "산문이라 배정 칸이 없습니다 — 사용자가 그 단계 질문지에서 확인해 줄 때까지 전제로 남습니다",
+  chipFollowUp: "후속 확인",
+  chipFollowUpTip: "문장 자체가 후속 확인·결정을 요구하는 항목",
+  chipOther: "그 외",
+  chipOtherTip:
+    "미결 소절에 적혀 있으나 문장에 후속 신호는 없는 항목 — 소절 자체가 미결 선언이라 그대로 셉니다",
+  ledgersNote: `이 대장들은 <b>서로 다른 읽기</b>입니다 — 배정 칸이 있는 것은 첫 줄뿐이고,
+나머지는 물어볼 자리가 정해져 있지 않습니다. <b>합산하지 않습니다.</b>`,
+  noSections: (artifacts, unreadable) =>
+    unreadable > 0
+      ? `읽은 산출물에는 <code>## Assumptions &amp; Open Questions</code> 절이 없습니다 —
+    <b>읽지 못한 경로 ${unreadable}곳</b>에 그 절이 있다면 세지 않았습니다. (읽은 산출물 ${artifacts}개)`
+      : `산출물에 <code>## Assumptions &amp; Open Questions</code> 절이 없습니다 — 이 실행은
+    미결 대장을 남기지 않았거나 아직 산출물을 쓰지 않았습니다. (읽은 산출물 ${artifacts}개)`,
+  unreadSections: (sections, unread, emptySections) =>
+    `<code>## Assumptions &amp; Open Questions</code> 절이 ${sections}곳 있고, 그중 <b>${unread}곳은 이 리더가 아는 모양이 아닙니다</b> — 표(<code>| 항목 | 배정 |</code>)도,
+      <code>[assumption]</code> 태그도, <code>**OQ1**</code> 형태의 대장 id 도 없습니다.
+      <b>미결이 없다는 뜻이 아니라 읽지 못했다는 뜻입니다.</b>
+      명시적으로 <code>None.</code>을 선언한 절은 ${emptySections}곳입니다.`,
+  noOpenPill: "미결 없음",
+  noOpenPillTip: "미결 대장 절은 있고 그 안이 비어 있음 — 명시적으로 '없음'을 선언한 상태",
+  allNone: (sections, partial) =>
+    partial
+      ? ` 읽은 <code>## Assumptions &amp; Open Questions</code> 절 ${sections}곳은 모두 <code>None.</code>입니다.`
+      : ` <code>## Assumptions &amp; Open Questions</code> 절 ${sections}곳이 모두 <code>None.</code>입니다.`,
+  lead: (items, sections, rows, exits) =>
+    `미결 <b>${items}건</b> · <code>## Assumptions &amp; Open Questions</code> 절 ${sections}곳 (원시 ${rows}행 → 중복 정리 후 ${items}건)${
+      exits > 0 ? ` · 이번 차수 밖으로 명시적으로 밀어낸 것 ${exits}건은 위 숫자에 없습니다` : ""
+    }.
+  엔진 규약은 <b>하류 단계가 미결을 필요로 하면 후속 질문으로 다시 묻는다</b>고 정합니다 — 여기 있는 항목은
+  없어진 것이 아니라 <b>다시 물어올 것</b>입니다. 항목이 닫혔다는 표시는 엔진이 쓰지 않으므로
+  <b>‘지난 단계’는 버려졌다는 뜻이 아니라 답이 보이지 않는다는 뜻</b>입니다.`,
+  catalogMissingNote: `stage 카탈로그가 없어 배정 칸의 단계 이름을 이 실행의 state.md 로만 판정했습니다 —
+    범위 밖 단계가 <b>배정 없음</b>으로 내려가 있을 수 있습니다.`,
+  headingPassed: (count) => `지난 단계로 배정됨 · ${count}건`,
+  headingCurrent: (count) => `현재 단계가 물어야 할 것 · ${count}건`,
+  summaryAhead: (count) => `예정 단계로 배정됨 ${count}건 — 그 단계에 가면 물어옵니다`,
+  summaryRest: (count) => `배정 없음·차수 밖 ${count}건`,
+};
+
+const timeline: TimelineStrings = {
+  section: "시간 분석",
+  endKinds: {
+    completed: "완료",
+    skipped: "건너뜀",
+    "awaiting-approval": "승인 대기",
+    "in-flight": "진행 중",
+    superseded: "재진입으로 대체",
+    paused: "일시정지",
+  },
+  segmentTip: (stage, endKind, from, to, split) =>
+    `${stage} — ${endKind}\n${from} → ${to}\n${split}`,
+  splitLine: (wait, parked, observed, conversation, unknown) =>
+    `사용자 대기 ${wait}분 · 일시중지 ${parked}분 · 관측 실행 ${observed}분 · 대화 ${conversation}분 · 미분류 ${unknown}분`,
+  zeroSecondTip: "0초 — 같은 초에 시작·완료",
+  loadArtifacts: (n) => `산출 ${n}`,
+  loadFailures: (n) => `실패 ${n}`,
+  loadDelegations: (n) => `리뷰 ${n}`,
+  loadHumanTurns: (n) => `사람 ${n}`,
+  noStageSpans: "감사 기록에 stage 구간 없음.",
+  noStageSpansPartial: (refused) =>
+    `읽은 감사 기록에 stage 구간 없음 — 감사 기록 경로 ${refused}곳은 읽지 않았습니다.`,
+  partialAuditNote: (refused) =>
+    `감사 기록 경로 ${refused}곳을 읽지 않았습니다. 아래의 시간·재작업·작업자 표는 읽은 이벤트만 쓰며, 빠진 이벤트는 시간·분류·추정 상태를 바꿀 수 있습니다 — 여기의 '없음'은 전체 실행에서의 없음이 아닙니다.`,
+
+  bucketWait: "사용자 대기",
+  bucketWaitTip: "관문·질문이 열린 뒤 사람이 답하기까지",
+  bucketParked: "일시중지",
+  bucketParkedTip: "present 한 모든 사본이 park 상태였던 구간",
+  bucketObserved: "관측 실행",
+  bucketObservedTip:
+    "5분 미만 이벤트 간격과 명시적 위임 구간의 합 — 순수 모델·CPU 실행 시간이 아닙니다",
+  bucketConversation: "대화",
+  bucketConversationTip:
+    "한 사본의 HUMAN_TURN 에서 바로 그 사본의 다음 HUMAN_TURN 까지. 엔진의 대화 응답(감사 기록을 남기지 않음)과 사람이 읽고 입력한 시간이 함께 들어 있고 원장에 그 경계가 없어, 대기도 실행도 아닌 자기 몫으로 둡니다",
+  bucketUnknown: "미분류",
+  bucketUnknownTip: "5분 이상인데 신뢰할 만한 마커가 없는 구간 — 실행으로 칠하지 않고 남겨 둡니다",
+
+  windowTipOpen: (silence) =>
+    `첫 기록 → 지금. 마지막 기록 이후 ${silence} 은 아래 분류에 포함되지 않는다(기록이 없어 분류할 수 없음).`,
+  windowTipClosed: "첫 기록 → 마지막 기록",
+  windowTeam: "팀 벽시계",
+  windowSolo: "전체 경과",
+  windowSub: (classified) => `아래 비율의 기준은 <b>분류 대상 ${classified}</b>`,
+  unrecordedPill: (silence) => `마지막 기록 이후 ${silence} 무기록`,
+  clonesPill: (clones) => `사본 ${clones}개`,
+  delegated: (h) => ` · 위임 ${h}`,
+  inFlight: (list) => `진행 중 ${list}`,
+  noneInFlight: "진행 중인 stage 없음",
+  runEnded: (at) => `run 이 끝났어요 — 시간 분석은 ${at} 기록까지예요`,
+  noneInFlightPartial: (refused) =>
+    `읽은 감사 기록에는 진행 중인 stage 없음 (읽지 않은 경로 ${refused}곳)`,
+  awaiting: (stage) => `승인 대기 <b>${stage}</b>`,
+  awaitingDecision: (name) => `결정 대기 <b>${name ?? "이름 없는 결정"}</b>`,
+  awaitingDecisionUnscoped:
+    '<span class="mute"> (범위 미확인 — state 의 유닛 위치로만 정함)</span>',
+  awaitingTeam: (unit, stage) =>
+    `유닛 승인 대기 <b>${unit}</b> · ${stage}<span class="mute"> (팀 소유 — 감사 기록에서 읽은 유닛 자신의 관문)</span>`,
+  awaitingTeamUnread:
+    '유닛 관문은 판독하지 못함<span class="mute"> (팀 소유 — claim 시도를 정하지 못해 유닛 승인 대기 여부를 판단하지 않았습니다)</span>',
+  awaitingReplied: (stage, unit) =>
+    `<b>${unit ? `${unit} · ${stage}` : stage}</b> 승인에 답함<span class="mute"> (아직 기록 안 됨 — 승인·거절을 기록하는 건 에이전트 차례)</span>`,
+  awaitingNone:
+    '열린 stage 관문 없음<span class="mute"> (Current Stage 행이 승인 대기가 아님 — 다른 질문은 "내 답변" 탭, 과거 제출 이력은 아래 재작업 표)</span>',
+  reworkPending: " · 반려 후 승인 전인 stage 있음",
+  mergedNote: (workers, clones) =>
+    `기록 ${workers}개(사본 ${clones}개) 병합 — 위 분류는 전 기록을 한 줄로
+       합친 <b>팀 단위</b> 수치. 개인별 시간은 <b>작업자별 분해</b> 참조.`,
+  axisSilenceTip: (silence) => `마지막 기록 이후 ${silence} — 기록이 없어 분류하지 않는 구간`,
+
+  reworkSummary: (rejected, h) => `재작업 — 반려 ${rejected}건 · ${h}`,
+  reworkNone: (approved) =>
+    approved === 0
+      ? "아직 승인된 관문이 없고, 반려·수정 기록도 없습니다."
+      : `반려·수정 기록 없음 — 지금까지의 승인 ${approved}건 모두 한 번에 통과.`,
+  reworkNonePartial: (refused) =>
+    `읽은 감사 기록에는 반려·수정 기록 없음 — 감사 기록 경로 ${refused}곳을 읽지 않아 그쪽의 반려는 보이지 않습니다.`,
+  reworkProvisionalTip: "아직 승인되지 않음 — 시간은 계속 늘어남",
+  feedbackCount: (n) => `${n}건`,
+  reasonsSummary: (n) => `사람이 적은 반려 사유 ${n}건 — 전문`,
+  reasonsNote: `원장에서 <code>**Feedback**</code>을 그대로 옮긴 것입니다. 반려·수정 쌍에서 중복은 제거했고
+  stage 당 최대 6건까지 보관합니다 — 요약하거나 자르지 않습니다.`,
+  reworkStatShare: (share) => `재작업 ${share}%`,
+  statRejected: "반려",
+  statApproved: "승인",
+  statRevisions: "수정 회차",
+  statJumps: "stage 점프",
+  statReopened: "유닛 재진입",
+  statReopenedTip:
+    "사람의 요청으로 유닛 단위 stage 에 다시 들어간 횟수입니다(/aidlc --stage, 또는 재진입 때 Redo). 내용을 판정한 것이 아니므로 반려 수와 재작업 시간에는 넣지 않습니다",
+  statFreezeBlocked: "검토중 편집 차단",
+  colSubmissions: "제출",
+  colSubmissionsTip: "STAGE_AWAITING_APPROVAL — 관문에 올린 횟수",
+  colRejections: "반려",
+  colRevisions: "수정",
+  colRevisionsTip: "수정 회차 / state.md 의 누적 Revision count",
+  colRework: "재작업",
+  colReworkTip: "첫 반려 → 마지막 승인",
+  colReason: "사유",
+  colReasonTip: "사람이 적은 반려 사유 — 전문은 표 아래에 있습니다",
+  reworkNote: (share, classified, provisional) =>
+    `재작업 = <b>첫 반려부터 마지막 승인까지</b>. 두 번 반려된 stage 는 그 사이 승인까지 포함한
+  "아직 받아들여지지 않은 시간"이며, 회차별 합이 아닙니다 — 원장에 수정 회차의 종료 표시가 없습니다.
+  ${share}% 는 분류 대상 구간(${classified}) 기준.${
+    provisional ? " <b>~</b> 표시 stage 는 아직 승인 전이라 계속 늘어납니다." : ""
+  }`,
+
+  colStage: "stage",
+  colTrack: "진입 구간",
+  colTotalMin: "전체(분)",
+  colWait: "사용자 대기",
+  colParked: "중지",
+  colObserved: "관측 실행",
+  colConversation: "대화",
+  colConversationTip:
+    "사람 턴에서 바로 다음 사람 턴까지 — 엔진의 대화 응답과 사람이 읽고 입력한 시간이 섞여 있어 어느 쪽으로도 계상하지 않는다.",
+  colUnknown: "미분류",
+  unknownSplit: (turn, rest) =>
+    `HUMAN_TURN 으로 기록된 행에서 끝난 공백 ${turn} · 나머지 ${rest}(다른 기록으로 끝났거나 기록이 덮지 못한 공백) — 둘 다 기록이 설명하지 못하는 시간이라 대기로도 일로도 세지 않아요`,
+  colWorkload: "작업량",
+  ganttLegend: `막대 <b>길이</b>는 달력 점유, <b>내부 색</b>은 그 구간의 분류 —
+  <i class="lg wait"></i>대기 · <i class="lg parked"></i>중지 · <i class="lg observed"></i>관측 ·
+  <i class="lg conv"></i>대화 · <i class="lg unknown"></i>미분류. 테두리는 종료 방식: 청록=완료 · 회색=건너뜀 · 주황=승인대기 ·
+  파랑=진행중 · 점선=재진입으로 대체(그 시도는 끝났고 다시 시작됨). 0초 stage 는 막대가 아니라 눈금.
+  <b>관측 시간이 많이 기록된 stage 는 길이가 아니라 「관측 실행」 열로 읽으세요</b> — 「미분류」는 기록이 설명하지 못하는 시간이라 일로 세지 않습니다.`,
+  ganttLegendUnits:
+    "<b>unit-major 라 유닛 단위 stage 의 막대는 그 stage 의 일이 아니에요</b>(첫 유닛 stage 막대가 뒤 stage 유닛의 일까지 담아요) — 그런 stage 는 이 표의 열이 아니라 위 유닛 보기로 비교하세요.",
+  colUnitStage: "유닛",
+  inferredStartTip: (firstWrite, receipt) =>
+    receipt
+      ? `시작을 이 stage 에서 유닛의 첫 기록 쓰기(${firstWrite})로 앞당겼습니다. UNIT_STARTED receipt 는 ${receipt} 입니다. 기록상 가장 이른 근거이지 측정된 시작이 아닙니다.`
+      : `UNIT_STARTED receipt 가 없습니다(완료 receipt 만 있음). 시작은 이 stage 에서 유닛의 첫 기록 쓰기(${firstWrite})입니다. 기록상 가장 이른 근거이지 측정된 시작이 아닙니다.`,
+  inferredRowTip:
+    "구간 시작 중 하나 이상이 유닛의 첫 기록 쓰기에서 추정한 값입니다 — 막대 툴팁을 보세요.",
+  durationUnknownTip:
+    "시작 receipt 도, 이 stage 에서 유닛의 기록 쓰기도 없는 완료입니다. 길이를 알 수 없습니다.",
+  pauseOnlyTip:
+    "열린 구간 없이 기록된 일시정지입니다. 시작은 같은 초에 다른 clone 이 쓴 행이라 엔진 규칙에 따라 일시정지에 밀렸거나 기록되지 않았고, 완료도 관측되지 않았습니다. 엔진은 이 유닛을 일시정지로 읽습니다.",
+  unitSummary: (units, stages) => `유닛 보기 — stage ${stages}개, 유닛 구간 ${units}행`,
+  unitVsStage: (stage, unitHours, stageHours) =>
+    stageHours === undefined
+      ? `<b>${stage}</b>: 유닛 구간 합 ${unitHours}`
+      : `<b>${stage}</b>: 유닛 구간 합 ${unitHours} · stage 막대 ${stageHours}`,
+  unitStageSkipped: (stage) => `<b>${stage}</b>: 기록된 행이 모두 건너뜀`,
+  colUnitTrack: "진입 구간 (유닛 구간 기준)",
+  unitNote: `유닛 수명 행에서 읽은 값입니다. 구간은 <code>UNIT_STARTED</code> 또는 <code>UNIT_RESUMED</code> 에서
+  열리고 <code>UNIT_PAUSED</code>(점선) 또는 <code>UNIT_COMPLETED</code> 에서 닫힙니다. <code>UNIT_SKIPPED</code> 는 열린
+  구간을 닫고, 열린 구간이 없으면 눈금입니다. 두 clone 이 같은 초에 한 유닛에 남긴 행은 순서를 알 수 없어 엔진과
+  똑같이 줄입니다 — 일시정지가 있을 수 있으면 그것을, 다음으로 시작·재개를 택하고, 열린 구간 없이 남은 일시정지는
+  눈금입니다. 팀 소유에서는 엔진이 이 checkout 의 claim 시도 행만 먼저 남기지만, 이 보기는 지난 시도에 쓴 시간도
+  쓴 시간이라 모든 시도의 행을 읽습니다. 그래서 두 시도가 같은 초에 겹치면 결과가 엔진과 다를 수 있습니다. 이 보기는 완료까지이며, 그 뒤의 유닛 체크포인트 작업(검증, 유닛 끝 관문)은
+  들어 있지 않습니다. 시작 receipt 가 작업 뒤에 찍히거나 wave·복구 완료처럼 아예 없을 수 있어서, 같은 시도·같은 clone
+  안에서 그 stage 의 유닛 첫 기록 쓰기를 시작으로 쓸 수 있습니다(행의 <b>~</b>, 자세한 내용은 막대 툴팁). 기록상 가장 이른
+  근거이지 측정된 시작이 아닙니다. 구간 안의 분류는 그 유닛을 실행한 clone 의 이벤트로 계산하고, 그 이벤트가 덮지 못한
+  시간은 미분류입니다. stage 별 수치는 유닛 구간의 <b>합</b>이라 겹치는 유닛은 두 번 셉니다. unit-major 에서는 유닛들이
+  뒤 stage 를 도는 동안 엔진이 Current Stage 를 첫 유닛 단위 stage 에 두므로, 위의 stage 막대는 달력 점유이고 유닛
+  구간보다 훨씬 길 수도 — 뒤 stage 라면 짧을 수도 — 있습니다. 둘은 다른 질문에 답하며, 어느 쪽도 다른 쪽을 바로잡지
+  않습니다.`,
+  observedCaveat: `관측 실행은 5분 미만 이벤트 간격과 명시적 위임 구간의 합이며, 순수 모델·CPU 실행 시간이 아님.
+  <b>대화</b>는 사람 턴에서 바로 다음 사람 턴까지 — 엔진의 대화 응답은 감사 기록을 남기지 않으므로 그 구간에는
+  엔진 작업과 사람이 읽고 입력한 시간이 함께 들어 있고, 원장에 경계가 없어 <b>어느 쪽으로도 계상하지 않습니다</b>.`,
+  unknownGapsSummary: (count) => `미분류 5분+ 공백 ${count}건 (상위 12)`,
+  unknownGapsNote: "대기·중지·실행 어느 쪽으로도 확정할 수 없어 실행 시간에서 분리한 구간.",
+  minutes: (min) => `${min}분`,
+  hiddenCols: (names) => `${names.join("·")}는 모든 행이 0 이라 숨김`,
+  howToRead: "읽는 법",
+  colObservedTip:
+    "5분 미만 이벤트 간격과 명시적 위임 구간의 합 — 순수 모델·CPU 실행 시간이 아닙니다.",
+  delegatedIn: (min) => `위임 ${min}`,
+  delegatedInTip:
+    "관측 실행에 포함된 위임 시간 — 위임 요청과 그 완료를 짝지은 구간입니다. 관측 실행에 이미 들어 있어 따로 더하지 않습니다.",
+  asksSummary: (count, shown) =>
+    `물음별 답 시간 — ${count}건${count > shown ? ` (대기 긴 순 ${shown})` : ""}`,
+  askGate: "게이트",
+  askDecision: "결정",
+  askQuestion: (type) => (type ? `엔진 질문(${type})` : "엔진 질문"),
+  askSpan: (min) => `물음~답 ${min}`,
+  askWaitTip: "대기로 센 시간 — 답 바로 앞 행부터 답까지입니다. 1분 미만이면 — 로 표시합니다.",
+  asksNote:
+    "물음과 그 답을 같은 clone 의 행에서 짝지었습니다. 그 사이 파일 쓰기·센서·오류·세션 종료 행은 물음을 닫지 않고, 대기로는 답 바로 앞 간격만 셉니다. 답이 기록되지 않은 물음은 이 목록에 없습니다.",
+  asksParallelNote:
+    "여러 clone 이 있는 run 입니다. 위 합계의 사용자 대기는 다른 clone 이 일하던 구간을 빼므로, 이 목록의 합보다 작을 수 있습니다.",
+  inferredPark: (h, anomalies) =>
+    `일시중지 중 ${h}은 session 재개 이벤트로 추정${
+      anomalies > 0 ? ` · park 마커 이상 ${anomalies}건` : ""
+    }.`,
+
+  workerShapeOverlap: (clones, overlap) => `clone ${clones}개 · 겹쳐 일한 시간 ${overlap}`,
+  workerShapeSequential: (clones, handover) =>
+    `clone ${clones}개 · 순차 인계(겹침 없음)${handover ? ` · 인계 공백 ${handover}` : ""}`,
+  workerSummary: (shape) => `작업자별 분해 — ${shape}`,
+  leadTag: "주도",
+  leadTagTip: "승인 게이트를 통과시킨 = 워크플로를 주도한 clone",
+  noUnitAttribution: "감사 기록에 유닛 귀속 없음",
+  personTotal: "사람-시간 합",
+  personParallelism: "실효 병렬도",
+  colClone: "clone",
+  colEvents: "이벤트",
+  colSpanMin: "구간(분)",
+  colGates: "게이트",
+  colMainStage: "주 stage",
+  colUnits: "유닛",
+  workerNote: (teamIdle, deltaNote) =>
+    `각 행은 <b>그 clone 의 타임라인만</b> 보고 계산 = "각 사람이 얼마나 기다렸나".
+  위쪽 팀 단위 중지·대기 합(${teamIdle})은 전 기록을 한 줄로 합친 값.
+  ${deltaNote}`,
+  deltaSame: "두 수치가 거의 같음.",
+  deltaOverlapUnder: (delta, overlap) =>
+    `합친 기록에서는 남의 이벤트가 내 대기를 메워 <b>${delta} 만큼 덜 잡힘</b>
+             (clone 들이 ${overlap} 겹쳐 일했다).`,
+  deltaOverlapOver: (delta) =>
+    `합친 기록이 <b>${delta} 더 많음</b> — 겹치지 않은 인계 공백은 팀으로는 멈춘
+             시간이지만 개인 타임라인에는 부재.`,
+  deltaHandoverUnder: (delta) =>
+    `차이 <b>${delta}</b> 는 겹침이 아니라 인계 때문 — clone 들이 시간상 전혀 겹치지
+             않으므로(겹침 0), 한 clone 이 park 한 구간을 팀 단위로는 다른 clone 의 부재로 볼 수 없다.`,
+  deltaHandoverOver: (delta, handover) =>
+    `합친 기록이 <b>${delta} 더 많음</b> — clone 간 인계 공백
+             (${handover})은 팀으로는 멈춘 시간이지만 개인 타임라인에는 부재.`,
+  hostNote: (workers, clones) =>
+    `기록 ${workers}개 중 일부는 <b>같은 작업 사본</b>이 다른 호스트 이름으로
+         남긴 것 — 사본 수는 ${clones}개다.`,
+  endedParked: (label, at) => `<b>${label}</b> 는 ${at} 에 park 상태로 끝남`,
+  endedParkedTail: " — 되돌아오지 않은 기록이다.",
+  parallelismNote: `실효 병렬도 = 사람-시간 합 ÷ 팀 벽시계. 겹쳐 일한 시간이 있을 때만 의미가 있어
+       겹침이 0이면 표시하지 않는다.`,
+  unitColumnNote: `유닛 열이 "—"인 clone 은 유닛을 적은 감사 기록(<code>Unit</code> 필드나 유닛 단위
+  <code>Context</code>)이 없습니다 — 예를 들어 stage 단위 작업만 한 경우입니다. 담당 stage 는 그대로 집계됩니다.`,
+};
+
+const picker: PickerStrings = {
+  docTitle: "AI-DLC 워크스페이스 선택",
+  heading: "워크스페이스 선택",
+  currentMark: "지금 보는 중",
+  launchMark: "실행한 폴더에서 찾음",
+  tagWorkspace: "워크스페이스",
+  tagAidlcTree: "aidlc 트리",
+  tagUnreadable: "읽기 불가",
+  open: "열기",
+  explorerEmpty: "표시할 하위 폴더가 없습니다.",
+  explorerRootsLabel: "탐색 루트",
+  breadcrumbLabel: "현재 경로",
+  pathLabel: "경로",
+  pathHint: "Enter 로 이동",
+  dirMatchCount: (n) => `일치하는 폴더 ${n}개`,
+  showHidden: "숨김 폴더 보기",
+  hideHidden: "숨김 폴더 감추기",
+  filterNoMatch: "일치하는 폴더가 없습니다.",
+  noWorkspacesFound: "검색된 워크스페이스가 없습니다.",
+  foundCount: (found, scanned) => `${found}곳 · 폴더 ${scanned}개 확인`,
+  wsFilterLabel: "찾은 워크스페이스를 이름이나 경로로 거르기",
+  wsFilterPlaceholder: "이름이나 경로로 거르기",
+  wsFilterNoMatch: "일치하는 워크스페이스가 없습니다.",
+  runGroup: "실행 기록 있음 · state 갱신 최근 순",
+  idleGroup: (count) => `실행 기록 없음·보관 ${count}곳`,
+  otherLocations: "다른 위치 열기",
+  pathNote:
+    "<code>aidlc/spaces/</code> 가 있는 폴더는 대시보드로 열고, 아닌 폴더는 그 안을 보여 줍니다 · 마지막 <code>/</code> 뒤에 쓰면 지금 폴더에서 거릅니다 · <kbd>Tab</kbd> 자동 완성 · <kbd>Esc</kbd> 되돌리기 · <code>~</code> 사용 가능",
+  foundHeading: "찾은 워크스페이스",
+  rescan: "다시 검색",
+  truncated: "검색 한도에 도달했습니다. 아래 '다른 위치 열기'에서 경로를 직접 지정할 수 있습니다.",
+  summaryPctLabel: "완성도",
+  summaryBlankLabel: "빈 답",
+  summaryBlankNone: "빈 답 없음",
+  summaryUpdated: (rel) => `state ${rel} 갱신`,
+  agoNow: "방금",
+  agoMinutes: (n) => `${n}분 전`,
+  agoHours: (n) => `${n}시간 전`,
+  agoDays: (n) => `${n}일 전`,
+  summaryNoRunNone: "실행 기록 없음",
+  summaryNoRunAmbiguous: "인텐트 여러 개 · 활성 커서 없음",
+  summaryNoRunArchived: (count) => `보관된 인텐트 ${count}개뿐 · 활성 없음`,
+  summaryUnreadable: "state.md 읽기 불가",
+  summaryFailed: "조회 실패",
+  summaryProgressTip: (done, total, asOf) =>
+    `state.md 기준 ${done}/${total} · 갱신 ${asOf} (전환 시점에 기록되므로 stage 진행 중에는 뒤처집니다)`,
+  summaryBlockersTip: (asked) => `질문 ${asked}건 중 미답변 · 디스크에서 방금 읽음`,
+  summaryBlockersUnreadableTip: (n) => `읽지 못한 질문 경로 ${n}곳이 있어 최소값입니다`,
+  footer: (path) => `현재 워크스페이스 · <code>${path}</code> ·
+         <a href="/">대시보드로 돌아가기</a>`,
+};
+
+const usage: UsageStrings = {
+  windowLong7d: "최근 7일",
+  windowLong30d: "최근 30일",
+  windowLongAll: "전체 기간",
+  window7d: "7일",
+  window30d: "30일",
+  windowAll: "전체",
+  trendToggleLabel: "추이 기간 선택",
+  tokenToggleLabel: "집계 기간 선택",
+
+  creditSection: "크레딧",
+  statusLoading: "수집 중",
+  statusOk: "정상",
+  statusPartial: "부분 데이터",
+  statusFailure: "수집 실패",
+  statusNone: "데이터 없음",
+  rowPlan: "플랜",
+  rowUsed: "누적 사용량",
+  rowRemaining: "잔량",
+  rowLimit: "플랜 한도",
+  rowRatio: "사용률",
+  ratioUnavailable: "사용률 계산 불가",
+  ratioLabel: (pct) => `사용률 ${pct}`,
+  fetchFailed: (reason) =>
+    `최신 데이터를 가져오지 못했습니다 (${reason}). 아래는 마지막 성공값입니다.`,
+  rawSummary: "실패 원문 보기",
+  rawEmpty: "(원문 없음)",
+  stalePill: "오래된 데이터",
+  firstCollection: "크레딧 사용량을 처음 수집하고 있습니다.",
+  noCreditYet: "아직 수집된 크레딧 데이터가 없습니다. 수집이 진행되면 이 자리에 표시됩니다.",
+  staleNote: "마지막 성공 이후 10분 이상 경과 — 표시값이 최신이 아닐 수 있습니다.",
+  pollHalted: (failures, retryEvery) =>
+    `연속 ${failures}회 실패해 자동 수집 주기를 ${retryEvery}분으로 늘렸습니다 — 깨진 상태를 5분마다 두드리지 않기 위해서입니다. 아래 값은 마지막 성공값이며, 수집이 한 번이라도 성공하면 원래 주기로 돌아옵니다. 새로고침 버튼으로 지금 바로 다시 시도할 수도 있습니다.`,
+  pollHaltedReason: (reason) => `마지막 실패 사유: ${reason}`,
+  lastSuccess: (at) => `마지막 성공: ${at}`,
+  chartEmpty: (w) => `${w} 누적 사용량 추이: 표시할 데이터 없음`,
+  chartSummary: (w, min, max, latest) =>
+    `${w} 누적 사용량 추이, 최소 ${min}, 최대 ${max}, 최신 ${latest}`,
+  chartNoData: "표시할 데이터가 없습니다",
+
+  tokenSection: "토큰 사용량",
+  tokenPartial: "부분 집계",
+  rowTokenTotal: "총 토큰",
+  rowInput: "입력",
+  rowOutput: "출력",
+  rowThinking: "사고 토큰 (출력 내 포함)",
+  rowCacheRead: "캐시 읽기",
+  rowCacheCreate: "캐시 생성",
+  rowCachedPrompt: "프롬프트 캐시 적중",
+  rowCachedPromptTip:
+    "캐시 읽기 ÷ (입력 + 캐시 읽기 + 캐시 생성). 프롬프트 토큰 중 캐시에서 온 비율이며, 출력은 분모에 없습니다.",
+  rowSessions: "세션",
+  rowMessages: "API 응답",
+  colModel: "모델",
+  colShare: "비중",
+  tokenChartEmpty: (w) => `${w} 일별 토큰 추이: 표시할 데이터 없음`,
+  tokenChartSummary: (w, days, min, max, latest) =>
+    `${w} 일별 토큰 추이, ${days}일, 최소 ${min}, 최대 ${max}, 최근 ${latest}`,
+  noTokens: "이 기간에 기록된 Claude Code 토큰 사용량이 없습니다. 기간을 넓혀 보세요.",
+  span: (range) => `집계 구간: ${range}`,
+  sidechain: (count) => `서브에이전트 응답 ${count}건이 위 합계에 포함되어 있습니다.`,
+  rowSessionWall: "세션 벽시계",
+  rowSessionApi: "그중 API",
+  rowSessionTool: "그중 도구 실행",
+  rowSessionCount: "체크포인트 있는 세션",
+  sessionCrossCheck:
+    "Claude Code 가 세션마다 남긴 체크포인트에서 읽은 값입니다. 감사 원장으로 계산하는 타이밍 패널과 독립된 소스이므로 대조용이며, 두 수치가 다르면 감사 원장이 권위 있는 값입니다. 세션은 stage 에 귀속되지 않아 stage 별로 쪼갤 수 없습니다. 체크포인트는 세션 도중에 기록되므로, 위 `세션` 수보다 적을 수 있습니다 — 진행 중인 세션은 아직 남기지 않았을 수 있습니다.",
+  sessionStraddling: (count) =>
+    `세션 ${count}개는 창 경계를 걸쳐 위 합계에서 제외했습니다 — 레코드가 세션 누적 총합이라 잘라 넣을 수 없습니다.`,
+  sessionAllStraddling: (count) =>
+    `이 창에 온전히 든 세션이 없습니다 — 세션 ${count}개가 창 경계를 걸칩니다. 기간을 넓혀 보세요.`,
+  noteNoTranscripts: (triedPath) =>
+    `Claude Code 트랜스크립트를 찾지 못했습니다 (${triedPath}). 이 워크스페이스에서 Claude Code로 실행한 이력이 없거나, 다른 경로에서 실행되었습니다.`,
+  noteFilesCapped: (count) =>
+    `바이트 상한 때문에 트랜스크립트 파일 ${count}개를 읽지 않았습니다 — 아래 수치가 빠짐없다고 볼 수 없습니다.`,
+  noteUnreadableFiles: (count) => `읽지 못한 트랜스크립트 파일 ${count}개.`,
+  noteMalformedLines: (count) => `형식이 깨진 줄 ${count}개를 건너뛰었습니다.`,
+};
+
+const errorPage: ErrorPageStrings = {
+  docTitle: "AI-DLC dashboard",
+  heading: "워크플로 표시 불가",
+  triedPathLabel: "읽으려던 경로: ",
+  checkThis: `확인할 것: <code>&lt;root&gt;/aidlc/active-space</code> 와
+<code>&lt;root&gt;/aidlc/spaces/&lt;space&gt;/intents/active-intent</code> 커서가 실재하는 record 를 가리키는지.`,
+  pickAnother: "다른 폴더 선택",
+  readFailed: (message) => `읽기 중 오류: ${message}`,
+  noSelection: "(선택 없음)",
+  notAWorkspace: (dir) =>
+    `${dir} 에 aidlc/spaces/ 가 없어 워크스페이스가 아닙니다 — AI-DLC 기록은 그 아래에 있습니다.`,
+  noWorkspaceSelected: "워크스페이스 미선택.",
+  otherRecord:
+    "이 알림은 지금 대시보드가 보여 주는 것과 다른 record 에서 왔습니다 — 다른 탭에서 워크스페이스를 바꾼 것 같아요. 그 파일을 보려면 그 record 를 다시 고르세요.",
+};
+
+const cli: CliStrings = {
+  needValue: (flag) => `${flag} 에 값 필요`,
+  mustBeNumber: (flag, raw) => `${flag} 는 숫자여야 함: ${raw}`,
+  msFloor: (flag, floor, zeroOk, got) =>
+    `${flag} 는 밀리초 단위로 ${floor} 이상이어야 함${zeroOk ? " (0 은 비활성화)" : ""}: ${got}`,
+  portRange: (max, got) => `--port 는 1~${max} 범위여야 함: ${got}`,
+  needRoot: "--root 에 경로 필요",
+  pathMissing: (path) => `경로 없음: ${path}`,
+  notAWorkspace: (path) => `aidlc/ 디렉터리 없음 — AI-DLC 워크스페이스 루트가 아님: ${path}`,
+  harnessMissing: (path) => `--harness 로 지정한 디렉터리 없음: ${path}`,
+  needUsage: "--usage 에 값 필요 (auto|kiro|claude)",
+  badUsage: (raw) => `--usage 는 auto|kiro|claude 중 하나여야 함: ${raw}`,
+  needLang: "--lang 에 값 필요 (ko|en)",
+  badLang: (raw) => `--lang 는 ko|en 중 하나여야 함: ${raw}`,
+  unknownArg: (arg) => `알 수 없는 인자: ${arg}`,
+  noRootPicker: "--root 없음 — 브라우저에서 폴더 선택",
+  bunTooOld: (have, floor) =>
+    `bun ${have} 은 너무 오래됐습니다 — ${floor} 이상이 필요합니다. bun upgrade 로 올린 뒤 다시 실행하세요.`,
+  alreadyRunning: (url) => `이미 실행 중입니다 — ${url}`,
+  switchedTo: (root) => `실행 중인 대시보드를 이 워크스페이스로 바꿨습니다: ${root}`,
+  switchRefused: (root, status) =>
+    `실행 중인 대시보드가 이 워크스페이스로 바꾸지 않았습니다(${status}) — 보던 화면이 그대로 열립니다: ${root}`,
+  portBusy: (port) =>
+    `포트 ${port} 을 다른 프로그램이 쓰고 있어 시작하지 못했습니다 — --port 로 다른 포트를 지정하세요(예: --port ${port + 1}).`,
+  dataDirInWorkspace: (dir, workspace) =>
+    `크레딧 기록을 ${dir} 에 씁니다 — 워크스페이스 ${workspace} 안입니다. 소스 실행은 clone 에서 시작하거나, AIDLC_DASHBOARD_DATA_DIR 를 워크스페이스 밖 폴더로 지정하세요.`,
+  pressEnterToClose: "Enter 를 누르면 닫힙니다.",
+  manualRefreshFailed: (detail) => `수동 새로고침 실패(격리됨): ${detail}`,
+  routeFailed: (route) => `${route} 실패:`,
+  creditBootFailed: (detail) => `크레딧 서브시스템 부팅 실패(대시보드는 계속 기동): ${detail}`,
+  unhandled: "처리되지 않은 오류:",
+  harnessNotFound: "미검출",
+  startupSummary: (audit, langDefault) => `audit ${audit}건 · lang ${langDefault} 기본`,
+  intentAmbiguous: (root) => `intent 가 여럿인데 active-intent 커서 없음: ${root}`,
+  intentArchived: (root, count) =>
+    `보관(archived)된 intent ${count}개만 있음 — 엔진도 이를 활성 intent 로 고르지 않습니다. 새 작업을 시작하거나, 보관된 것을 보려면 active-intent 커서로 지정하세요: ${root}`,
+  noWorkflow: (root) => `AI-DLC 워크플로 미검출: ${root}`,
+};
+
+const openFile: OpenFileStrings = {
+  badRel: "경로가 비었거나 너무 김",
+  badChars: "경로에 허용되지 않는 문자 포함",
+  outsideRecord: "record 폴더 밖의 경로는 열기 불가",
+  extension: (allowed) => `이 확장자는 열기 불가 (${allowed.join(" / ")} 만 허용)`,
+  symlinkEscape: "symlink 가 record 폴더 밖을 가리킴",
+  notFound: "파일 없음",
+  statFailed: "파일 정보 읽기 불가",
+  notAFile: "일반 파일이 아님",
+  platformUnsupported: (platform) => `이 플랫폼(${platform})은 열기 미지원`,
+  interpreterMetachars: "파일 이름에 해석기 특수문자 포함 — 열기 거부",
+  openerMissing: (cmd) => `열기 명령 ${cmd} 를 PATH 에서 찾을 수 없음`,
+  spawnFailed: (detail) => `열기 실패: ${detail}`,
+  spawnFailedLog: (cmd, detail) => `파일 열기 실패(${cmd}): ${detail}`,
+  readFailed: (detail) => `파일 읽기 실패: ${detail}`,
+};
+
+const viewer: ViewerStrings = {
+  docTitle: (rel) => `${rel} — 원문`,
+  back: "← 대시보드",
+  openInEditor: "에디터로 열기",
+  size: (bytes) => `크기 ${bytes}`,
+  truncated: (shown, total) =>
+    `앞부분 ${shown} 만 표시했습니다 (전체 ${total}). 나머지는 에디터로 열어 확인하세요.`,
+  refusalHeading: "원문을 보여줄 수 없습니다",
+  empty: "빈 파일입니다.",
+  blankCount: (blank, total) => `답을 기다리는 질문 ${blank} / ${total}`,
+  outlineHeading: "질문",
+  badgeBlank: "답 비어 있음",
+  stateAnswered: "답함",
+  exampleTip: "예시 — 엔진이 읽지 않는 줄입니다(코드 블록이나 주석 안)",
+  copyPathLabel: "경로",
+  copyPathTip: "한 번 누르면 전체가 선택돼요 — 그대로 복사하세요",
+  untitledAsk: "제목 없는 답 칸",
+  unclosedNote:
+    "이 파일에 닫히지 않은 코드 블록이나 주석이 있어, 그 뒤를 모두 일반 텍스트로 읽었습니다.",
+};
+
+const explorer: ExplorerStrings = {
+  rootHome: "홈",
+  rootCurrent: "현재",
+  rootRoot: "루트",
+  volume: (name) => `볼륨 ${name}`,
+  mount: (name) => `마운트 ${name}`,
+  media: (name) => `미디어 ${name}`,
+  browseFailed: (dir, message) => `${dir} 열기 불가: ${message}`,
+};
+
+const freshness: FreshnessStrings = {
+  graphBehind: (lag, drift) =>
+    `감사 기록보다 ${lag} 뒤처짐 — 이 스냅샷은 stage 전이 시점에만 재컴파일됨${drift ? `. ${drift}` : ""}`,
+  graphUnreadable: "runtime-graph.json 읽기 실패 — units-generation 미진입 또는 미동기화",
+  stageGraphMissing: "stage-graph.json 없음 — 산출물 계약 판정 생략",
+  sensorDrift: (fired, missing) =>
+    `감사 기록의 sensor 발화 ${fired}건 중 ${missing}건이 이 스냅샷에 부재`,
+};
+
+const cards: CardStrings = {
+  unresolvedHeading: "남은 질문과 미뤄둔 결정",
+  unresolvedLede: "세 곳에서 따로 읽어요. 지금 run 을 멈추게 하는 것은 아니에요",
+  diagTitle: "진단 · 출처",
+  diagHooks: "hook 확인 필요",
+  diagStale: (names) => `낡은 출처: ${names}`,
+  healthTitle: "실행 상태",
+  colStage: "단계",
+  workChatTip:
+    "감사 로그에서 작업(이벤트가 촘촘한 구간·위임)과 대화(사람 턴 사이) 로 분류된 시간의 합입니다. 사람 응답 대기·일시중지·분류 불가 구간은 넣지 않습니다",
+  cellLabel: {
+    complete: "완료",
+    partial: "산출물 일부",
+    unsettled: "완료 기록 없음",
+    unverified: "확인 불가",
+    absent: "시작 전",
+    skipped: "건너뜀",
+    "n/a": "해당 없음",
+  },
+  decisionsTab: "미뤄둔 결정",
+  openQsTab: "열린 질문",
+  declaredTab: "단계가 선언한 질문",
+  colItemOwner: "항목 → 담당 단계",
+  colAge: "경과",
+  noDecisions: "미결 결정 없음",
+  noOpenQs: "열린 질문 없음",
+  noDeclared: "stage 가 선언한 미결 질문 없음",
+  notAllRead: "읽은 기록에는 없음 — 일부 기록은 읽거나 해석하지 못했습니다",
+  decisionsNote:
+    "산출물에 남은 기록을 모은 것입니다. 엔진이 닫힘 표시를 쓰지 않아 답했는지는 알 수 없고, 배정은 unit 이 아니라 stage 단위입니다.",
+  answersTab: "내 답변",
+  stuckTab: "막힘",
+  checksTab: "검사 실패",
+  errorsTab: "오류",
+  summaryTab: "요약",
+  colAsk: "질문 · 파일",
+  colWait: "대기",
+  colGuard: "stop hook",
+  colCount: "연속 차단",
+  colCheck: "검사 · stage",
+  colWhen: "시각",
+  colErrCmd: "엔진 명령 · 그 뒤",
+  moreRows: (n) => `외 ${n}건`,
+  moreDeferrals: "미결 전체 보기",
+  moreWaits: "대기 시간 분석 보기",
+  sourcesLabel: "출처",
+  sourceAge: (age) => `${age} 전`,
+  sourceMissing: "기록 없음",
+  sourceStale: "낡음",
+  sourceNames: {
+    disk: "파일",
+    audit: "audit",
+    "state.md": "state.md",
+    "runtime-graph": "runtime-graph",
+    "hooks-health": "stop hook",
+    "stage-graph": "stage-graph",
+    "agent-catalog": "에이전트 정의",
+  },
+};
+
+const kpi: KpiStrings = {
+  heading: "자세히 — 진행·사용량·시간·에이전트 상세 패널",
+  detailsTitle: "자세히",
+  tokenSub: (window) => `${window} 측정 토큰 · 로컬에 한도 없음`,
+  usageNone: "사용량 기록 없음",
+};
+
+const tsum: TimeSummaryStrings = {
+  title: "종류별 시간",
+  classified: (h) => `기록된 ${h}을 나눴어요`,
+  classifiedPartial: (h, refused) =>
+    `읽은 기록 ${h}을 나눴어요 — 감사 기록 경로 ${refused}곳은 읽지 않았어요`,
+  tail: (h) => `그 뒤 ${h} 동안은 기록이 없어 나누지 않았어요`,
+  empty: "아직 나눌 기록이 없어요",
+  emptyPartial: (refused) =>
+    `읽은 기록에는 나눌 시간이 없어요 — 감사 기록 경로 ${refused}곳은 읽지 않았어요`,
+  more: "시간 분석 전체 보기",
+  stagesTitle: "단계별 시간",
+  stagesNote: (top, alt) =>
+    `막대 길이는 달력상 머문 시간, 색은 그 안에서 한 일이에요. 미분류는 기록이 설명하지 못하는 시간이라 일로 세지 않아요${
+      top ? ` — 관측 실행이 가장 긴 단계는 ${top}${alt ? `(미분류까지 더하면 ${alt})` : ""}` : ""
+    }`,
+  stagesNoteUnits: (top, alt) =>
+    `막대 길이는 달력상 머문 시간, 색은 그 안에서 한 일이에요. unit-major 라 유닛 단계는 막대가 그 단계의 일이 아니어서, Σ 는 그 단계에 기록된 유닛 구간을 더한 값이에요(유닛 완료 뒤 체크포인트 작업은 빠져요)${
+      top
+        ? ` — 그렇게 비교하면 관측 실행이 가장 긴 단계는 ${top}${alt ? `(미분류까지 더하면 ${alt})` : ""}`
+        : ""
+    }`,
+  unitsWorkTip:
+    "Σ 이 단계에 기록된 유닛 구간의 관측 실행 합 — unit-major 에서는 첫 유닛 단계의 막대가 뒤 단계 유닛의 일까지 담고, 뒤 단계의 막대는 짧거나 없어요. 동시에 돈 유닛은 겹쳐 더해지고, 유닛 완료 뒤 체크포인트 작업은 빠져요",
+  rankPartial: (refused) => ` — 읽은 기록 기준이에요(감사 기록 경로 ${refused}곳은 읽지 않았어요)`,
+  unitsUnknownTip:
+    "Σ 같은 유닛 구간의 미분류 합 — 유닛을 돈 clone 의 기록이 덮지 못한 시간도 들어가요",
+  unitsWorkFloorTip: " · 길이를 알 수 없는 유닛 구간이 있어 이 값은 최소치예요(+)",
+  unitsNoneTip:
+    "기록된 유닛 구간이 없어요 — unit-major 에서 이 단계의 막대는 이 단계의 일이 아니어서 비교에서 뺐어요",
+  unspannedTip: "유닛은 이미 이 단계를 돌았지만 단계 시작 기록이 아직 없어 머문 시간이 없어요",
+  colStage: "단계",
+  colObserved: "관측 실행",
+  colUnknown: "미분류",
+  colSpan: "머문 시간",
+  live: "진행 중",
+  reworkSome: (rejected, h) => `반려 ${rejected}건 · 재작업 ${h}`,
+  reworkFirstTime: (approved) => `승인 ${approved}건, 모두 한 번에 통과했어요`,
+  reworkNoGate: "아직 승인된 게이트가 없어요",
+  reworkPartial: (refused) =>
+    `읽은 기록에는 반려가 없어요 — 감사 기록 경로 ${refused}곳은 읽지 않았어요`,
+  creditOf: (limit, used) => `${limit} 중 ${used} 사용`,
+  resets: (date) => `${date} 초기화`,
+  over: "한도를 넘었어요",
+  stale: (date) => `${date} 기준 값이에요 — 그 뒤로 새로 읽지 못했어요`,
+  staleFailed: (date) => `${date} 기준 값이에요 — 최근 수집이 실패했어요`,
+  tokensNoLimit: "Claude Code 는 사용 한도를 알려 주지 않아 비율은 그리지 않아요",
+};
+
+const journey: JourneyStrings = {
+  title: "단계 진행",
+  summary: (total, inScope) => `단계 ${total}개 · 이 계획에서 하는 것 ${inScope}개`,
+  showOut: (n) => `범위 밖 ${n}개도 보기`,
+  phaseOut: "범위 밖",
+  kind: {
+    done: "끝남",
+    active: "진행 중",
+    awaiting: "승인 대기",
+    revising: "수정 중",
+    todo: "아직",
+    skip: "실행 중에 건너뜀",
+    out: "이 계획의 범위 밖",
+  },
+  hereYou: "내 차례",
+  hereNow: "지금",
+  hereUnverified: "위치 미확인",
+  workChat: (time) => `작업+대화 ${time}`,
+  unitsTitle: "유닛",
+  unitHere: "지금",
+  unitDone: "끝남",
+  matrixLink: "stage × unit 매트릭스",
+};
+
+const agents: AgentStrings = {
+  section: "에이전트",
+  place: (stage, unit) => `${stage}${unit ? ` · ${unit}` : ""}`,
+  pass: (n) => `${n}차`,
+  openSince: (age) => `${age} 전 요청`,
+  openTitle: "지금 열린 리뷰 요청",
+  colSince: "요청",
+  openTip:
+    "완료가 아직 없는 리뷰 요청 가운데, 지금 run 이 있다고 확인된 단계의 요청만 보여 줍니다(그 위치의 unit 을 알면 그 unit 의 요청만). 요청이 열려 있다는 기록일 뿐, 리뷰어가 지금 일하고 있다는 증거는 아닙니다. 단계에 선언된 담당이나 Active Agent 는 세지 않습니다",
+  noneOpen: (ago) => `지금 위치에 열린 리뷰 요청 없음 — 마지막 완료 ${ago} 전`,
+  noneOpenUnverified: (ago) =>
+    `run 위치가 확인되지 않아 지금 열린 리뷰 요청은 말할 수 없음 — 마지막 완료 ${ago} 전`,
+  reviewersTitle: "리뷰어 — 기록된 리뷰",
+  colAgent: "에이전트",
+  colReviews: "리뷰",
+  reviewersTip:
+    "요청과, 그 요청에 답한 완료를 Request Id 와 fingerprint 로 짝지었습니다(시간 분석과 같은 규칙). 시간은 요청부터 완료까지를 더한 값이라 시간 분석의 위임 시간과 다를 수 있습니다. 엔진이 리뷰 기록 파일까지 확인해 세는 수와도 다를 수 있습니다",
+  reviewerValue: (reviews, ready, notReady, rePasses, unfinished, time) =>
+    [
+      `리뷰 ${reviews}`,
+      `통과 ${ready}`,
+      notReady ? `보완 ${notReady}` : "",
+      rePasses ? `재검토 ${rePasses}` : "",
+      unfinished ? `끝내지 못함 ${unfinished}` : "",
+      time,
+    ]
+      .filter(Boolean)
+      .join(" · "),
+  where: (stage, unit, count) =>
+    `${stage}${unit ? `/${unit}` : ""}${count > 1 ? ` ×${count}` : ""}`,
+  moreWhere: (n) => `외 ${n}곳`,
+  pendingTitle: "답한 완료를 찾지 못한 요청",
+  pendingNote:
+    "읽은 기록에서 이 요청에 답한 완료를 찾지 못했습니다. 지금 일하는 중이라는 뜻은 아닙니다 — run 이 이미 지나갔거나, 다른 unit·workflow·attempt 의 요청이거나, 위치를 확인하지 못했을 수 있습니다",
+  unpairedNote: (completions, legacy) =>
+    `${[
+      completions ? `짝이 되는 요청을 찾지 못한 리뷰 완료 ${completions}건` : "",
+      legacy ? `Request Id 없이 남은 옛 요청 ${legacy}건` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ")} — 짝을 지을 수 없어 위 숫자에 넣지 않았습니다`,
+  helpersTitle: "보조 에이전트 — 보낸 기록",
+  colHelper: "종류",
+  colHelperFinished: "완료",
+  colHelperCount: "보냄 · 완료",
+  helperFinished: (finished) => `완료 ${finished}`,
+  helperValue: (sent, finished) => `보냄 ${sent} · 완료 ${finished}`,
+  helpersNote:
+    "보조 에이전트는 보낸 기록과 완료 기록을 이어 줄 키가 없어 종류별 개수만 셉니다 — 걸린 시간도, 지금 일하는 중인지도 알 수 없습니다",
+  helpersNoDispatch: "이 기록에는 보낸 기록(SUBAGENT_DISPATCHED)이 없어 완료만 셉니다",
+  unnamedHelper: "(이름 없음)",
+  declaredSummary: (n) => `단계 계약상의 담당 ${n} — 일한 기록이 아님`,
+  declaredNote:
+    "stage-graph 가 단계마다 선언한 담당입니다. 누가 실제로 일했는지는 위의 기록으로만 알 수 있습니다",
+  inlineNote: (inline, total) =>
+    `이번 범위의 ${total}단계 중 ${inline}단계는 메인 세션이 담당 역할을 직접 맡아(inline) 담당 에이전트를 보내지 않습니다 — 리뷰어는 따로 보낼 수 있습니다`,
+  roles: (lead, support, reviews) =>
+    [
+      lead.length ? `담당 ${lead.join(", ")}` : "",
+      support.length ? `보조 ${support.join(", ")}` : "",
+      reviews.length ? `리뷰 ${reviews.join(", ")}` : "",
+    ]
+      .filter(Boolean)
+      .join(" · "),
+  colTier: "일의 종류",
+  recordedMark: "기록 있음",
+  recordedLegend: "이 run 의 기록에 리뷰어나 보조 에이전트로 나타남",
+  tier: { judgment: "판단", balanced: "균형", templated: "정형" },
+  tierTip:
+    "agent-tiers.json 이 정한 일의 종류. 엔진이 이것으로 모델과 effort 를 고른다 — 실제로 쓴 모델은 아니다",
+  quiet: "이 기록에는 위임이 없음",
+  quietPartial: (refused) => `읽은 기록 안에는 위임이 없음 (audit 경로 ${refused}개를 읽지 않음)`,
+  partialNote: (refused) =>
+    `audit 경로 ${refused}개를 읽지 않았습니다 — 아래는 읽은 기록 안의 내용입니다`,
+  isolated: (workflow) => `따로 실행(${workflow})`,
+  more: (n) => `외 ${n}개`,
+};
+
+export const KO: Strings = {
+  locale: "ko",
+  warn,
+  blockers,
+  status,
+  journey,
+  tsum,
+  overview,
+  page,
+  health,
+  deferrals,
+  timeline,
+  picker,
+  usage,
+  errorPage,
+  cli,
+  openFile,
+  viewer,
+  explorer,
+  freshness,
+  cards,
+  kpi,
+  agents,
+};
