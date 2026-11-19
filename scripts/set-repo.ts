@@ -12,8 +12,8 @@
 // every copy at once.
 //
 // The installers named it too, to download release assets, until 2026-11-19: the security
-// review asked for that path to go (no checksum check), so they install a local archive only
-// and name no repository. A download path comes back only with checksum verification.
+// review asked for that path to go (no checksum check), so they install a local archive or
+// build from the clone, and name no repository.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -21,11 +21,13 @@ import * as path from "node:path";
 const ROOT = path.join(import.meta.dir, "..");
 
 /** The files that name the repository, relative to the root. */
-// README.md is not in the list while there is no public repository (2026-11-17, the owner's call):
-// the address it named was deleted, so its install section clones and builds instead and names no
-// address at all. When the public repository exists, restore README's release install (the one-liners
-// and the Releases link) and put README.md back here, so this script and the test hold it again.
-export const REPO_FILES = ["package.json"] as const;
+// README.md came back on 2026-11-19 (the owner's call): its install commands must paste and run
+// as they are, so they name the clone URL instead of a placeholder. README also links other
+// repositories; `OTHER_REPOS` lists those, so the test can still tell a stale address apart.
+export const REPO_FILES = ["package.json", "README.md"] as const;
+
+/** Repositories a published file may name besides this one — links to other projects. */
+export const OTHER_REPOS: readonly string[] = ["awslabs/aidlc-workflows"];
 
 const SLUG = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 

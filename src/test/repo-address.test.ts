@@ -10,7 +10,13 @@
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { REPO_FILES, repoMentions, rewriteRepo, sourceRepo } from "../../scripts/set-repo";
+import {
+  OTHER_REPOS,
+  REPO_FILES,
+  repoMentions,
+  rewriteRepo,
+  sourceRepo,
+} from "../../scripts/set-repo";
 
 const ROOT = path.join(import.meta.dir, "..", "..");
 const read = (rel: string) => fs.readFileSync(path.join(ROOT, rel), "latin1");
@@ -19,7 +25,7 @@ const SOURCE = sourceRepo(read("package.json"));
 describe("one repository address", () => {
   for (const rel of REPO_FILES) {
     test(`${rel} names only ${SOURCE}`, () => {
-      const mentions = repoMentions(read(rel));
+      const mentions = repoMentions(read(rel)).filter((m) => !OTHER_REPOS.includes(m));
       expect(mentions.length).toBeGreaterThan(0);
       expect([...new Set(mentions)]).toEqual([SOURCE]);
     });

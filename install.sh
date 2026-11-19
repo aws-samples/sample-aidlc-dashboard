@@ -7,8 +7,9 @@
 #   sh install.sh
 #
 # builds the executable for this machine from the clone (`bun run package --only
-# <platform>`), installs it and starts it. It downloads nothing: the clone is the
-# source, and the build needs no `bun install` (there are no runtime dependencies). A
+# <platform>`) and installs it, with an `aidlc-dashboard` launcher on PATH. It downloads
+# nothing: the clone is the source, and the build needs no `bun install` (there are no
+# runtime dependencies). A
 # release download path was here until 2026-11-19 and was removed in the security
 # review, because it installed an executable fetched over the network with no checksum
 # check. No prebuilt executable is published any more either: one carries Bun, which
@@ -46,7 +47,7 @@
 #   AIDLC_ARCHIVE=/path/to.zip     install this archive instead of building one
 #   AIDLC_DIR=~/.aidlc-dashboard   where to install
 #   AIDLC_NO_BIN=1                 do not create the ~/.local/bin launcher
-#   AIDLC_NO_RUN=1                 do not start the dashboard afterwards
+#   AIDLC_NO_PATH=1                leave the shell profile alone (no PATH line)
 
 set -eu
 
@@ -179,10 +180,27 @@ fi
 # `data/` is found beside the executable it actually is (src/runtime.ts), never
 # beside a link in ~/.local/bin.
 #
+# The install is done when typing `aidlc-dashboard` runs it. macOS's default zsh does not
+# have ~/.local/bin on PATH, so the launcher dir is added to the shell's startup file —
+# said first, once, and skipped with AIDLC_NO_PATH=1. A child process cannot change the
+# PATH of the shell that started it, so README's install block ends with the same
+# `export` line for the terminal it was pasted into; new terminals read the file.
+#
 # `RUN` is what the closing hint tells the user to type, and it is decided HERE
 # rather than at the end: printing "add this to PATH" and then telling them to type
 # the bare name is two instructions that contradict each other.
 RUN="$DIR/$EXE_NAME"
+NEW_SHELL_HINT=""
+# The startup file the login shell reads for an interactive terminal; empty when this
+# script cannot write one that shell reads (fish has its own syntax and file).
+profile_file() {
+  case "$(basename "${SHELL:-sh}")" in
+    zsh) printf '%s\n' "${ZDOTDIR:-$HOME}/.zshrc" ;;
+    bash) if [ "$OS" = darwin ]; then printf '%s\n' "$HOME/.bash_profile"; else printf '%s\n' "$HOME/.bashrc"; fi ;;
+    fish) ;;
+    *) printf '%s\n' "$HOME/.profile" ;;
+  esac
+}
 if [ "${AIDLC_NO_BIN:-}" != "1" ]; then
   if mkdir -p "$BIN_DIR" 2>/dev/null; then
     cat > "$BIN" <<EOF
@@ -191,9 +209,26 @@ exec "$DIR/$EXE_NAME" "\$@"
 EOF
     chmod +x "$BIN"
     say "▸ Launcher: $BIN"
+    LINE="export PATH=\"$BIN_DIR:\$PATH\""
+    PROFILE=$(profile_file)
     case ":$PATH:" in
       *":$BIN_DIR:"*) RUN="aidlc-dashboard" ;;
-      *) say "  ⚠ $BIN_DIR is not on PATH. Add it in your shell profile to run it by name." ;;
+      *)
+        if [ "${AIDLC_NO_PATH:-}" = "1" ]; then
+          say "  ⚠ $BIN_DIR is not on PATH, and AIDLC_NO_PATH=1 leaves your shell profile alone."
+        elif [ -z "$PROFILE" ]; then
+          say "  ⚠ $BIN_DIR is not on PATH. For fish: fish_add_path $BIN_DIR"
+        elif [ -f "$PROFILE" ] && grep -qxF "$LINE" "$PROFILE"; then
+          RUN="aidlc-dashboard"
+          NEW_SHELL_HINT="$LINE"
+        elif printf '\n# aidlc-dashboard launcher (added by install.sh)\n%s\n' "$LINE" >>"$PROFILE"; then
+          say "▸ Added $BIN_DIR to PATH in $PROFILE"
+          RUN="aidlc-dashboard"
+          NEW_SHELL_HINT="$LINE"
+        else
+          say "  ⚠ Could not write $PROFILE — add this line to your shell profile: $LINE"
+        fi
+        ;;
     esac
   else
     say "▸ Cannot create $BIN_DIR, so no launcher was made."
@@ -204,19 +239,13 @@ fi
 say ""
 say "Installed — v$VER ($PLATFORM)"
 say ""
+if [ -n "$NEW_SHELL_HINT" ]; then
+  say "  New terminals find it by name. In this one, run first:"
+  say "    $NEW_SHELL_HINT"
+  say ""
+fi
 say "  $RUN"
 say "  $RUN ~/path/to/workspace"
 say ""
 say "  The browser opens on its own (--no-open turns that off)."
 say "  Read-only — this dashboard never writes to the workspace."
-
-# ---- start ------------------------------------------------------------------
-# By its real path, as the launcher does, so `data/` is found beside it. `exec`, so
-# Ctrl+C stops the dashboard itself — which is why TMP is removed by hand first: an
-# exec'd process never runs this shell's EXIT trap.
-[ "${AIDLC_NO_RUN:-}" = "1" ] && exit 0
-say ""
-say "▸ Starting it now (Ctrl+C stops it; AIDLC_NO_RUN=1 skips this step)"
-rm -rf "$TMP"
-trap - EXIT INT TERM
-exec "$DIR/$EXE_NAME"
