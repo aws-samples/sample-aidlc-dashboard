@@ -38,13 +38,41 @@
  * 2.1s), and then nothing grows. We do not clean Kiro's directory — it is another tool's state, and
  * making less of it is the honest share we control.
  *
+ * **CLI V3 is a second server generation, read through a second adapter.** In kiro-cli 3.x `kiro-cli
+ * acp` can start either harness — the `--agent-engine` flag, then the `acp.agentEngine` setting, then a
+ * launch default (`cli/agent-harness.md` "ACP clients"; `cli/v3/acp-migration.md`). V3 removes
+ * `_kiro.dev/commands/execute` and replaces `/usage` with `_kiro/account/getUsage`. Measured on kiro-cli
+ * 3.5.0 (2026-11-19):
+ *
+ *   | launch, `clientInfo.name` | server | `commands/execute` | `account/getUsage` |
+ *   |---|---|---|---|
+ *   | nothing set, `aidlc-dashboard` | V2 | works | -32601 Method not found |
+ *   | nothing set, any other name | V3 | — | — |
+ *   | `--agent-engine=v3`, `aidlc-dashboard` | V3 | -32603 Internal error | works, no session, `{}` |
+ *
+ * **The default is V3, and this client is kept on V2 by name.** The doc's exception "Kiro recognizes the
+ * client as one that still needs V2" matches `clientInfo.name` exactly, case-insensitively: `aidlc-dashboard`
+ * and `AIDLC-Dashboard` get V2, while `aidlc-dashboardx`, `my-aidlc-dashboard`, `aidlc`, `zed` and
+ * `test-client` get V3 (measured on 3.5.0, `initialize` alone). That is Kiro's accommodation, not a
+ * contract — it ends when Kiro drops the name, and `acp.agentEngine v3` overrides it already, since a
+ * named harness always wins. The name is not changed to steer the generation either way.
+ *
+ * So the argv names no engine: pinning one would break kiro-cli before 2.36 (no flag) or a Linux machine
+ * that cannot run V3. Instead the generation is read from `initialize` (`isCliV3Server`) — never from
+ * `protocolVersion`, which is 1 on both. V3's `data` has the same schema as V2's, with one measured
+ * difference: `percentage` arrives as a whole number (195 where V2 sent 195.9594). `getUsage` is NOT in
+ * the advertised `extensionMethods` list on 3.5.0, so the call cannot be gated on it the way the
+ * migration guide asks; a refusal is reported as one, loudly. And V3 needs no session at all for it, so
+ * the V3 path writes no session files.
+ *
  * Hard contract (same as the old collector): argument-array spawn (`shell: true` forbidden, NFR1.1),
  * minimal environment variables (NFR1.2), a timeout (BR1.3), and no raw output left in files
  * (volatile, BR3.3).
  *
- * **Do not forget it is an experimental extension.** `cli/acp.md` says *"These extensions are
- * experimental and subject to change"*. So a schema change must fail **loudly** — that is exactly why
- * the old path's failure mode was bad: it received prose without knowing it had failed and was
+ * **Do not forget these methods have moved once already.** `cli/acp.md` used to call the `_kiro.dev/`
+ * extensions *"experimental and subject to change"*; it now says they *"apply to the CLI v2 ACP server
+ * only"*, and V3 replaced the one this module used. So a schema change must fail **loudly** — that is
+ * exactly why the old path's failure mode was bad: it received prose without knowing it had failed and was
  * misdiagnosed as a timeout. But "loudly" means, as the `mapAcpUsage` comment says, **telling missing
  * apart from wrong-typed**, not lumping both together and refusing everything.
  */
@@ -264,8 +292,21 @@ const INIT_PARAMS = {
     fs: { readTextFile: false, writeTextFile: false },
     terminal: false,
   },
+  // kiro-cli 3.5.0 starts V2 for exactly this name when nothing names an engine — see the header.
   clientInfo: { name: "aidlc-dashboard", version: "1" },
 } as const;
+
+/**
+ * Whether an `initialize` result came from the CLI V3 server. V3 advertises its optional methods in
+ * `agentCapabilities._meta.kiro.extensionMethods`; the V2 server sends no `_meta` there at all
+ * (measured, kiro-cli 3.5.0). Anything unreadable is V2 — the path that worked before this check.
+ */
+export function isCliV3Server(initResult: unknown): boolean {
+  const field = (v: unknown, key: string): unknown =>
+    typeof v === "object" && v !== null ? (v as Record<string, unknown>)[key] : undefined;
+  const kiro = field(field(field(initResult, "agentCapabilities"), "_meta"), "kiro");
+  return Array.isArray(field(kiro, "extensionMethods"));
+}
 
 function errText(e: AcpResponse["error"]): string {
   if (e === undefined) return "unknown error";
@@ -391,8 +432,8 @@ export function mapAcpUsage(data: unknown): ParseResult {
 /**
  * Run `/usage` once over ACP and return a `ParseResult`. Never throws.
  *
- * The session reuses the id cached in `deps.session` through `session/load`, and on failure (deleted,
- * stale id) falls back once to `session/new`.
+ * On a V2 server the session reuses the id cached in `deps.session` through `session/load`, and on
+ * failure (deleted, stale id) falls back once to `session/new`. A V3 server needs no session.
  */
 export async function collectUsageViaAcp(deps: AcpCollectorDeps = {}): Promise<ParseResult> {
   const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -419,6 +460,19 @@ export async function collectUsageViaAcp(deps: AcpCollectorDeps = {}): Promise<P
         raw: "",
         reason: `collection failed: initialize (${errText(init.error)})`,
       };
+    }
+
+    if (isCliV3Server(init.result)) {
+      // V3: one typed call, no session — see the generation table in the header.
+      const usage = await rpc.call("_kiro/account/getUsage", {});
+      if (usage.error !== undefined) {
+        return {
+          ok: false,
+          raw: "",
+          reason: `collection failed: /usage (_kiro/account/getUsage) refused (${errText(usage.error)})`,
+        };
+      }
+      return readUsageResult(usage.result);
     }
 
     let sessionId: string | undefined;
@@ -456,33 +510,37 @@ export async function collectUsageViaAcp(deps: AcpCollectorDeps = {}): Promise<P
       command: { command: "usage", args: {} },
     });
     if (exec.error !== undefined) {
-      // A changed method or schema lands here. It is an experimental extension, so this path occurs normally.
+      // A changed method or schema lands here — this method already changed once (see the V3 note above).
       return {
         ok: false,
         raw: "",
         reason: `collection failed: /usage execution refused (${errText(exec.error)})`,
       };
     }
-    const res = exec.result;
-    if (typeof res !== "object" || res === null) {
-      return {
-        ok: false,
-        raw: clip(JSON.stringify(res ?? null)),
-        reason: "No recognisable credit figures found (the format may have changed).",
-      };
-    }
-    const r = res as Record<string, unknown>;
-    // `!== false` is not enough — a vanished field or a `"false"` string would pass.
-    // Observed responses always carry `success: true`, so anything else is not called a success.
-    if (r.success !== true) {
-      return {
-        ok: false,
-        raw: clip(typeof r.message === "string" ? r.message : JSON.stringify(r)),
-        reason: "collection failed: /usage did not report success.",
-      };
-    }
-    return mapAcpUsage(r.data);
+    return readUsageResult(exec.result);
   } finally {
     rpc.close();
   }
+}
+
+/** The `{success, message, data}` envelope both generations answer `/usage` with (measured on both). */
+function readUsageResult(res: unknown): ParseResult {
+  if (typeof res !== "object" || res === null) {
+    return {
+      ok: false,
+      raw: clip(JSON.stringify(res ?? null)),
+      reason: "No recognisable credit figures found (the format may have changed).",
+    };
+  }
+  const r = res as Record<string, unknown>;
+  // `!== false` is not enough — a vanished field or a `"false"` string would pass.
+  // Observed responses always carry `success: true`, so anything else is not called a success.
+  if (r.success !== true) {
+    return {
+      ok: false,
+      raw: clip(typeof r.message === "string" ? r.message : JSON.stringify(r)),
+      reason: "collection failed: /usage did not report success.",
+    };
+  }
+  return mapAcpUsage(r.data);
 }
