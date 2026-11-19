@@ -26,8 +26,6 @@ Korean and English (`?lang=ko|en`, or `--lang` for the default).
 - Bun 1.4.0 or later ([bun.sh](https://bun.sh)), installed by you: the dashboard is built and run
   with it, and nothing here installs it or ships a copy of it.
 - An AI-DLC workspace: a folder holding `aidlc/spaces/` (where AI-DLC keeps its records).
-- Optional: [Kiro CLI](https://kiro.dev) (`kiro-cli` on PATH) for the credit panel, or Claude Code
-  transcripts under `~/.claude/projects/` for the token panel.
 
 ## Install
 
