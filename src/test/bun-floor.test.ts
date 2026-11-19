@@ -1,15 +1,15 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: MIT-0
 
-// The minimum Bun a SOURCE run accepts, pinned to ONE number.
-//
-// Since 1.13 the release is a single executable per platform with Bun inside it
-// (scripts/package.ts), so a user never meets this floor: the installers no longer look
-// for bun, install it or compare its version, and the start scripts that did are gone.
-// The floor still guards `bun run src/server.ts` from a checkout — `package.json`'s
-// `engines.bun` is that number, and the server reads it at run time (`src/version.ts`).
-// This file keeps the manifest, the server and the README's one mention of it agreed,
-// and keeps the installers free of bun.
+// The minimum Bun, pinned to ONE number. Bun is a prerequisite the person installs
+// (2026-11-19: no executable with Bun inside is published, so nothing is shipped under
+// Bun's licences). The floor guards `bun run src/server.ts` from a checkout —
+// `package.json`'s `engines.bun` is that number, and the server reads it at run time
+// (`src/version.ts`) — and the build `install.sh` runs from the clone, because the
+// executable it makes embeds the Bun that built it. That check imports the server's
+// comparator rather than copying the number. This file keeps the manifest, the server
+// and the README's one mention of it agreed, and keeps the installers from installing
+// bun or copying the floor.
 //
 // What this does NOT prove is that the floor still runs the code. 1.4.0 was measured
 // (the full suite passes on it, 2026-10-14), but typecheck runs against the PINNED types
@@ -63,7 +63,7 @@ describe("one Bun floor, for source runs", () => {
     expect(belowFloor(Bun.version, FLOOR)).toBe(false);
   });
 
-  test("README states the same floor wherever it names one — once, for the source run", () => {
+  test("README states the same floor wherever it names one — once, under Prerequisites", () => {
     const named = [...read("README.md").matchAll(/Bun (\d+\.\d+\.\d+) or (?:later|newer)/gi)].map(
       (m) => m[1],
     );
@@ -71,14 +71,19 @@ describe("one Bun floor, for source runs", () => {
   });
 });
 
-describe("the installers carry no bun", () => {
+describe("the installers never install bun", () => {
   for (const rel of ["install.sh", "install.ps1"]) {
-    test(`${rel} neither installs bun nor checks a version of it`, () => {
+    test(`${rel} installs no bun and keeps no copy of the floor`, () => {
       const text = read(rel);
-      expect(text).not.toMatch(/bun\.sh\/install/);
+      expect(text).not.toMatch(/bun\.sh\/install|brew install bun|npm (?:i|install) (?:-g )?bun/);
       expect(text).not.toMatch(/MIN_BUN|\$minBun|AIDLC_NO_BUN/);
+      expect(text).not.toContain(FLOOR);
     });
   }
+  test("install.sh checks the floor with the server's own comparator", () => {
+    const text = read("install.sh");
+    expect(text).toContain('import { BUN_FLOOR, belowFloor } from "./src/version.ts"');
+  });
   test("no start script is left to need it", () => {
     for (const rel of ["start.sh", "start.cmd", "start.ps1"]) {
       expect(fs.existsSync(path.join(ROOT, rel))).toBe(false);

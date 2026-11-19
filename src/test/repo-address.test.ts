@@ -5,11 +5,18 @@
 // after a move points readers at a repository that is gone. `scripts/set-repo.ts` rewrites
 // them; this keeps them rewritten. And the installers download nothing (the security
 // review, 2026-11-19): a network fetch with no checksum check is not to come back unnoticed.
+// install.sh builds from the clone instead; install.ps1 still takes a zip it is handed.
 
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { REPO_FILES, repoMentions, rewriteRepo, sourceRepo } from "../../scripts/set-repo";
+import {
+  OTHER_REPOS,
+  REPO_FILES,
+  repoMentions,
+  rewriteRepo,
+  sourceRepo,
+} from "../../scripts/set-repo";
 
 const ROOT = path.join(import.meta.dir, "..", "..");
 const read = (rel: string) => fs.readFileSync(path.join(ROOT, rel), "latin1");
@@ -18,7 +25,7 @@ const SOURCE = sourceRepo(read("package.json"));
 describe("one repository address", () => {
   for (const rel of REPO_FILES) {
     test(`${rel} names only ${SOURCE}`, () => {
-      const mentions = repoMentions(read(rel));
+      const mentions = repoMentions(read(rel)).filter((m) => !OTHER_REPOS.includes(m));
       expect(mentions.length).toBeGreaterThan(0);
       expect([...new Set(mentions)]).toEqual([SOURCE]);
     });
@@ -33,7 +40,11 @@ describe("the installers download nothing", () => {
       expect(text).not.toMatch(
         /\b(?:curl|wget)\s+-|Invoke-WebRequest|Invoke-RestMethod|\birm\s+\S+\s*\|/,
       );
-      expect(text).toContain("AIDLC_ARCHIVE is required");
+      // Where the executable comes from instead: a zip handed in, or (install.sh) one built
+      // from the clone the script sits in.
+      expect(text).toContain(
+        rel === "install.sh" ? "bun run scripts/package.ts" : "AIDLC_ARCHIVE is required",
+      );
     });
   }
 });

@@ -10,8 +10,8 @@ executable, in `data/` under the current directory for a source run (so start a 
 clone, not from the workspace), or wherever `AIDLC_DASHBOARD_DATA_DIR` points. When the Kiro credit
 panel collects, `kiro-cli acp` itself records its session under `~/.kiro/sessions/cli/`.
 
-The page is server-rendered HTML with no front-end framework or bundler, and it reads the record the way the AI-DLC
-engine's own readers do (stage state, the audit ledger, questions files, unit receipts), so a gate,
+The page is server-rendered HTML with no front-end framework or bundler, and it reads the record
+the way the AI-DLC engine's own readers do (stage state, the audit ledger, questions files, unit receipts), so a gate,
 an open decision or an unanswered question shows when the engine would wait on it. The page is in
 Korean and English (`?lang=ko|en`, or `--lang` for the default).
 
@@ -23,95 +23,77 @@ Korean and English (`?lang=ko|en`, or `--lang` for the default).
 
 ## Prerequisites
 
-- [Bun](https://bun.sh), to run from source or build the executable — not for a release install. The
-  version is under [Run from source](#run-from-source).
+- Bun 1.4.0 or later ([bun.sh](https://bun.sh)), installed by you: the dashboard is built and run
+  with it, and nothing here installs it or ships a copy of it.
 - An AI-DLC workspace: a folder holding `aidlc/spaces/` (where AI-DLC keeps its records).
 - Optional: [Kiro CLI](https://kiro.dev) (`kiro-cli` on PATH) for the credit panel, or Claude Code
   transcripts under `~/.claude/projects/` for the token panel.
 
-## Run from source
+## Install
 
-Bun 1.4.0 or later is required.
-
-```bash
-git clone <this repository's clone URL> aidlc-dashboard
-cd aidlc-dashboard
-bun install --frozen-lockfile
-bun run src/server.ts                        # start on the folder picker
-bun run src/server.ts --root ~/path/to/ws    # start on that workspace
-# → http://127.0.0.1:4321 (a source run does not open the browser — pass --open for that)
-```
-
-`Ctrl+C` stops it.
-
-## Install from a release
-
-A release carries one executable per platform with Bun inside it, so nothing else is needed. From
-the repository's **Releases** page, download into one folder:
-
-- the one zip for your machine, `aidlc-dashboard-<version>-<target>.zip` — the release's version is
-  already in the name, and `<target>` is `darwin-arm64` (Apple Silicon), `darwin-x64` (Intel Mac),
-  `linux-x64`, `linux-arm64` or `windows-x64` (also for Windows on ARM, under emulation);
-- `install.sh` (macOS, Linux) or `install.ps1` (Windows);
-- `SHA256SUMS`.
-
-On macOS and Linux, in that folder (the commands find the zip by name, so you do not type the
-version):
+No prebuilt executables are published: the installer builds one for this machine from your clone,
+with your Bun. On macOS and Linux (with `git`, `zip` and `unzip`; most Linux distributions package
+`zip` separately), paste:
 
 ```bash
-shasum -a 256 -c SHA256SUMS --ignore-missing     # Linux: sha256sum -c SHA256SUMS --ignore-missing
-AIDLC_ARCHIVE="$(ls aidlc-dashboard-*.zip)" sh install.sh
+git clone https://github.com/aws-samples/sample-aidlc-dashboard.git ~/sample-aidlc-dashboard
+sh ~/sample-aidlc-dashboard/install.sh
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-The first line must print `OK` for your zip; if it does not, delete the download and do not install
-it. On Windows, in PowerShell in that folder, compare the hash with the zip's line in `SHA256SUMS`,
-then install:
-
-```powershell
-$zip = (Get-Item .\aidlc-dashboard-*-windows-x64.zip).FullName
-(Get-FileHash $zip -Algorithm SHA256).Hash
-$env:AIDLC_ARCHIVE = $zip
-Get-Content -Raw .\install.ps1 | iex
-```
-
-Where it is installed, how to start it and how to update are below: the installers are the same ones
-the build path uses.
-
-## Build an executable (optional)
-
-To build the executable yourself instead, from the clone, and install it with the script in this
-repository:
+Then run it:
 
 ```bash
-bun run package dist --only darwin-arm64              # one target for this machine
-AIDLC_ARCHIVE="$(ls -t dist/aidlc-dashboard-*-darwin-arm64.zip | head -n 1)" sh install.sh
+aidlc-dashboard
 ```
 
-The target is one of `darwin-arm64` (Apple Silicon), `darwin-x64` (Intel Mac), `linux-x64` and
-`linux-arm64`. The zip name carries the version from `package.json`, so the second line takes the
-newest zip for that target — `dist/` keeps earlier builds. On macOS and Linux the executable goes
-to `~/.aidlc-dashboard`, and an `aidlc-dashboard` launcher to `~/.local/bin` (if that folder is not on
-PATH, the installer prints the full path). Then:
+The browser opens on the folder picker; `Ctrl+C` stops it. To open a workspace straight away, give
+its folder: `aidlc-dashboard ~/your/workspace`.
+
+The installer checks Bun's version, builds the executable, installs it to `~/.aidlc-dashboard`, puts
+an `aidlc-dashboard` launcher in `~/.local/bin`, and — when that folder is not on PATH — adds it in
+your shell's startup file (`~/.zshrc`, `~/.bash_profile` on macOS or `~/.bashrc` on Linux for bash,
+`~/.profile` otherwise), saying which. New terminals find the command by that line; the `export` line
+above does the same for the terminal you pasted into. It never installs Bun and downloads nothing;
+without Bun, or with one that is too old, it says so and stops.
+
+While the repository is private, `git clone` needs your GitHub sign-in (for example `gh auth login`,
+then `gh auth setup-git`).
+
+To update, paste:
 
 ```bash
-aidlc-dashboard                       # folder picker
-aidlc-dashboard ~/path/to/workspace   # straight to that workspace
+git -C ~/sample-aidlc-dashboard pull
+sh ~/sample-aidlc-dashboard/install.sh
 ```
 
-To update, `git pull`, build and run the same command again — or, from a release, download the new
-zip and run the installer on it: the install is replaced in place and the collected credit history
-(`data/usage.db`) is kept.
+The install is replaced in place and the collected credit history (`data/usage.db`) is kept.
+
+To build an archive for another machine instead — `darwin-arm64` for Apple Silicon, `darwin-x64` for
+an Intel Mac, `linux-x64` or `linux-arm64` — build it in the clone and hand the zip to the installer
+there (this example is `linux-x64`; the second line takes the newest zip for it, since `dist/` keeps
+earlier builds):
+
+```bash
+cd ~/sample-aidlc-dashboard
+bun run package dist --only linux-x64
+AIDLC_ARCHIVE="$(ls -t dist/aidlc-dashboard-*-linux-x64.zip | head -n 1)" sh install.sh
+```
 
 ### Windows
 
-In PowerShell, inside the clone:
+In PowerShell, paste:
 
 ```powershell
-bun install --frozen-lockfile
+git clone https://github.com/aws-samples/sample-aidlc-dashboard.git "$HOME\sample-aidlc-dashboard"
+cd "$HOME\sample-aidlc-dashboard"
 bun run package dist --only windows-x64
 $env:AIDLC_ARCHIVE = (Get-ChildItem dist\aidlc-dashboard-*-windows-x64.zip | Sort-Object LastWriteTime | Select-Object -Last 1).FullName
 Get-Content -Raw .\install.ps1 | iex
 ```
+
+Then run `aidlc-dashboard` in the same window. To update, run `git pull` in that folder and the last
+three lines again.
 
 `Get-Content -Raw … | iex` runs the script from memory, so an execution policy that blocks unsigned
 `.ps1` files does not stop it. The executable goes to
@@ -135,14 +117,27 @@ Set with environment variables (`$env:AIDLC_DIR = …` in PowerShell).
 
 | Variable | Meaning |
 |---|---|
-| `AIDLC_ARCHIVE` | The zip to install (a release download, or the `dist/…zip` built above). Required: the installers download nothing |
+| `AIDLC_ARCHIVE` | The zip to install (a `dist/…zip` built with `bun run package`). Required on Windows; on macOS and Linux it replaces the build `install.sh` runs. The installers download nothing |
 | `AIDLC_DIR` | Install location (default `~/.aidlc-dashboard` on macOS and Linux, `%LOCALAPPDATA%\Programs\aidlc-dashboard` on Windows). When set, the Windows move from the older location is skipped |
 | `AIDLC_BIN_DIR` | (macOS, Linux) Folder for the launcher (default `~/.local/bin`) |
 | `AIDLC_NO_BIN=1` | (macOS, Linux) Do not create the launcher |
-| `AIDLC_NO_PATH=1` | (Windows) Do not add the install folder to the user PATH |
+| `AIDLC_NO_PATH=1` | Leave PATH alone: on macOS and Linux, add no line to the shell's startup file; on Windows, do not add the install folder to the user PATH |
 
 You can also unzip the archive and run the executable directly (it holds the executable and this
 README). The credit history then lives in `data/` beside it.
+
+## Run from source
+
+For working on the code, from the clone:
+
+```bash
+cd ~/sample-aidlc-dashboard
+bun install --frozen-lockfile
+bun run src/server.ts
+```
+
+It listens on `http://127.0.0.1:4321` and, unlike the installed executable, does not open the browser
+(pass `--open` for that); `--root ~/your/workspace` starts on that workspace. `Ctrl+C` stops it.
 
 ## Flags
 
