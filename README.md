@@ -10,16 +10,12 @@ executable, in `data/` under the current directory for a source run (so start a 
 clone, not from the workspace), or wherever `AIDLC_DASHBOARD_DATA_DIR` points. When the Kiro credit
 panel collects, `kiro-cli acp` itself records its session under `~/.kiro/sessions/cli/`.
 
-The page is server-rendered HTML with no build step, and it reads the record the way the AI-DLC
+The page is server-rendered HTML with no front-end framework or bundler, and it reads the record the way the AI-DLC
 engine's own readers do (stage state, the audit ledger, questions files, unit receipts), so a gate,
 an open decision or an unanswered question shows when the engine would wait on it. The page is in
 Korean and English (`?lang=ko|en`, or `--lang` for the default).
 
 ![The dashboard on the synthetic reference workspace: a plan approval waiting on you, stage progress, units, time by kind and token usage](docs/images/overview.png)
-
-[aws-samples/sample-aidlc-pulse](https://github.com/aws-samples/sample-aidlc-pulse) is a separate
-sample that also reads the AI-DLC record (Python, standard library only). This one is a TypeScript
-server on Bun, and adds the usage panel described above.
 
 > **Note:** This is sample code, for non-production usage. You should work with your security and
 > legal teams to meet your organizational security, regulatory and compliance requirements before
@@ -53,17 +49,18 @@ bun run src/server.ts --root ~/path/to/ws    # start on that workspace
 A release carries one executable per platform with Bun inside it, so nothing else is needed. From
 the repository's **Releases** page, download into one folder:
 
-- the zip for your machine: `aidlc-dashboard-<version>-<target>.zip`, where `<target>` is
-  `darwin-arm64` (Apple Silicon), `darwin-x64` (Intel Mac), `linux-x64`, `linux-arm64` or
-  `windows-x64` (also for Windows on ARM, under emulation);
+- the one zip for your machine, `aidlc-dashboard-<version>-<target>.zip` — the release's version is
+  already in the name, and `<target>` is `darwin-arm64` (Apple Silicon), `darwin-x64` (Intel Mac),
+  `linux-x64`, `linux-arm64` or `windows-x64` (also for Windows on ARM, under emulation);
 - `install.sh` (macOS, Linux) or `install.ps1` (Windows);
 - `SHA256SUMS`.
 
-On macOS and Linux, in that folder:
+On macOS and Linux, in that folder (the commands find the zip by name, so you do not type the
+version):
 
 ```bash
 shasum -a 256 -c SHA256SUMS --ignore-missing     # Linux: sha256sum -c SHA256SUMS --ignore-missing
-AIDLC_ARCHIVE=aidlc-dashboard-<version>-darwin-arm64.zip sh install.sh
+AIDLC_ARCHIVE="$(ls aidlc-dashboard-*.zip)" sh install.sh
 ```
 
 The first line must print `OK` for your zip; if it does not, delete the download and do not install
@@ -71,8 +68,9 @@ it. On Windows, in PowerShell in that folder, compare the hash with the zip's li
 then install:
 
 ```powershell
-(Get-FileHash .\aidlc-dashboard-<version>-windows-x64.zip -Algorithm SHA256).Hash
-$env:AIDLC_ARCHIVE = ".\aidlc-dashboard-<version>-windows-x64.zip"
+$zip = (Get-Item .\aidlc-dashboard-*-windows-x64.zip).FullName
+(Get-FileHash $zip -Algorithm SHA256).Hash
+$env:AIDLC_ARCHIVE = $zip
 Get-Content -Raw .\install.ps1 | iex
 ```
 
@@ -86,11 +84,12 @@ repository:
 
 ```bash
 bun run package dist --only darwin-arm64              # one target for this machine
-AIDLC_ARCHIVE=dist/aidlc-dashboard-<version>-darwin-arm64.zip sh install.sh
+AIDLC_ARCHIVE="$(ls -t dist/aidlc-dashboard-*-darwin-arm64.zip | head -n 1)" sh install.sh
 ```
 
 The target is one of `darwin-arm64` (Apple Silicon), `darwin-x64` (Intel Mac), `linux-x64` and
-`linux-arm64`; the zip name in `dist/` carries the version. On macOS and Linux the executable goes
+`linux-arm64`. The zip name carries the version from `package.json`, so the second line takes the
+newest zip for that target — `dist/` keeps earlier builds. On macOS and Linux the executable goes
 to `~/.aidlc-dashboard`, and an `aidlc-dashboard` launcher to `~/.local/bin` (if that folder is not on
 PATH, the installer prints the full path). Then:
 
@@ -110,7 +109,7 @@ In PowerShell, inside the clone:
 ```powershell
 bun install --frozen-lockfile
 bun run package dist --only windows-x64
-$env:AIDLC_ARCHIVE = "dist\aidlc-dashboard-<version>-windows-x64.zip"
+$env:AIDLC_ARCHIVE = (Get-ChildItem dist\aidlc-dashboard-*-windows-x64.zip | Sort-Object LastWriteTime | Select-Object -Last 1).FullName
 Get-Content -Raw .\install.ps1 | iex
 ```
 
@@ -145,22 +144,11 @@ Set with environment variables (`$env:AIDLC_DIR = …` in PowerShell).
 You can also unzip the archive and run the executable directly (it holds the executable and this
 README). The credit history then lives in `data/` beside it.
 
-⚠️ **On Windows, a clone made with Git for Windows' default `core.autocrlf=true` before this
-repository pinned its line endings keeps CRLF files after a pull**, and `bun run lint` then fails on
-almost every file while `git status` stays clean. Commit or stash your changes, then:
-
-```powershell
-git rm -q --cached -r .
-git reset --hard
-```
-
-`reset --hard` drops uncommitted changes; the ignored `node_modules` and `data/` stay.
-
 ## Flags
 
 | Flag | Meaning | Default |
 |---|---|---|
-| `--root <path>` | Workspace root holding `aidlc/`. **Optional** (without it, the folder picker opens) | — |
+| `--root <path>` | Workspace root holding `aidlc/`, or give it as the first argument. **Optional** (without it, the folder picker opens) | — |
 | `--port <n>` | HTTP port. Also `AIDLC_DASHBOARD_PORT` | `4321` |
 | `--poll <ms>` | Browser refresh interval, `0` to turn it off (manual refresh still works) | `60000` |
 | `--interval <ms>` | Credit collection interval. Also `AIDLC_DASHBOARD_INTERVAL_MS` | `300000` |
@@ -279,12 +267,16 @@ If the switch is on and nothing arrives, check the operating system:
 ## Routes
 
 `/` (dashboard, or the picker when nothing is selected) · `/pick`, `/browse` (picker) · `/select`
-(choose) · `/api/workspaces` (the header's workspace list) · `/api/body` (refresh body) ·
-`/api/model` (the assembled JSON) · `/api/current` (current credit) ·
-`/api/trend?window=7d|30d|all` (credit trend) · `POST /api/refresh` (collect now) · `/healthz`.
+(choose) · `/api/workspaces` (the header's workspace list) · `/api/summary?dir=` (one picker card) ·
+`/api/body` (refresh body) · `/api/model` (the assembled JSON) · `/view?rel=` (a record file as
+source) · `/open?rel=` (open a record file in your editor) · `/api/current` (current credit) ·
+`/api/trend?window=7d|30d|all` (credit trend) · `POST /api/refresh` (collect now, JSON) ·
+`POST /api/credit/refresh` (collect now, then back to the page) · `/healthz`.
 
-`/api/current`, `/api/trend` and `POST /api/refresh` are **Kiro credit only**; on a token panel they
-still answer with credit data, and `503` when the collector did not start. Token figures have no
+`/view` and `/open` take a path inside the run's record only. `/api/current`, `/api/trend` and the
+two `POST` routes are **Kiro credit only**; on a token panel they still answer with credit data. When
+the collector did not start, the JSON routes answer `503` and the form route just returns to the
+page. Token figures have no
 endpoint of their own: they are in `/api/model`'s `usage` slot — `usage.credit` when `usage.kind` is
 `"kiro"`, `usage.tokens` when it is `"claude"`.
 
