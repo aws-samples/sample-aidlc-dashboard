@@ -22,7 +22,16 @@
 // SAME file is compiled for every target — so what was audited is byte-for-byte what
 // ships. Scanning the binary instead would also scan Bun's own runtime, whose strings
 // are not ours and would trip the machine patterns. Refuses to write any archive if
-// the audit fails; that check is the point of the script, so it is not skippable.
+// the audit fails; that check is the point of the script, so it is not skippable for an
+// archive that may be published.
+//
+// `--local` IS THE ONE EXCEPTION, AND ONLY install.sh PASSES IT (2026-11-19). Since Bun
+// became a prerequisite, the person installing builds on their own machine, and the
+// content audit matched THEIR account name against our README and bundle, so any login
+// that is also a word there fails the install (measured with `unknown`, the name Bun reports
+// when no user is set, which README contains; `kiro` or `node` would do the same). That
+// build is installed on the machine that made it and published nowhere, so it skips the
+// content patterns; the forbidden-file and contents checks below still run.
 //
 // Two build flags are load-bearing. `--no-compile-autoload-dotenv` and
 // `--no-compile-autoload-bunfig`: a compiled binary otherwise loads `.env` and
@@ -138,6 +147,7 @@ function bun(args: string[], work: string, what: string, inRoot = false): void {
 // ---- inputs -----------------------------------------------------------------
 
 const args = process.argv.slice(2);
+const local = args.includes("--local");
 const onlyAt = args.indexOf("--only");
 const only = onlyAt >= 0 ? args[onlyAt + 1] : undefined;
 const positional = args.filter((a, i) => !a.startsWith("--") && (onlyAt < 0 || i !== onlyAt + 1));
@@ -166,10 +176,12 @@ const bundle = path.join(bundleDir, bundled[0] as string);
 const readme = read(path.join(ROOT, "README.md"));
 
 const violations: string[] = [];
-for (const [label, body] of [
-  ["bundle.js", read(bundle)],
-  ["README.md", readme],
-] as const) {
+for (const [label, body] of local
+  ? []
+  : ([
+      ["bundle.js", read(bundle)],
+      ["README.md", readme],
+    ] as const)) {
   // Masked exactly as the repository audit masks it: the published slug (package.json `repository`) is
   // public by definition, and the README carries the install URL that cannot omit it.
   const text = maskPublicSlug(body);
@@ -260,6 +272,8 @@ for (const out of written) {
 }
 console.log(`  v${version} · ${written.length} target(s) → ${outDir}`);
 console.log(
-  `  leak audit (bundle, README): ${FORBIDDEN.length} path + ${SECRETS.length} content patterns passed${customers.names.length === 0 ? ` ⚠ no customer-name list (${customers.file}) — names not checked` : ""}`,
+  local
+    ? `  a local build (--local): ${FORBIDDEN.length} path patterns passed, content patterns not run — not for publishing`
+    : `  leak audit (bundle, README): ${FORBIDDEN.length} path + ${SECRETS.length} content patterns passed${customers.names.length === 0 ? ` ⚠ no customer-name list (${customers.file}) — names not checked` : ""}`,
 );
 console.log("  the whole-repository audit is separate — `bun run audit`");

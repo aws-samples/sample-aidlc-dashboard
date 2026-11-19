@@ -111,9 +111,10 @@ if (BUN_FLOOR && belowFloor(Bun.version, BUN_FLOOR)) { console.log(BUN_FLOOR); p
     die "Cannot run Bun to check its version (bun -e failed in $ROOT)."
   fi
   say "▸ Building for $PLATFORM with Bun $(bun --version) (from $ROOT)"
-  # The build log carries the release audit's lines, which are about publishing, not
-  # installing — shown only when the build fails.
-  if ! (cd "$ROOT" && bun run scripts/package.ts "$TMP/dist" --only "$PLATFORM") >"$TMP/build.log" 2>&1; then
+  # `--local`: this build is installed here and published nowhere, so package.ts skips the
+  # content audit that would match the installer's own account name (see its header). The
+  # build log is shown only when the build fails.
+  if ! (cd "$ROOT" && bun run scripts/package.ts "$TMP/dist" --only "$PLATFORM" --local) >"$TMP/build.log" 2>&1; then
     cat "$TMP/build.log" >&2
     die "The build failed — the existing install is untouched."
   fi
