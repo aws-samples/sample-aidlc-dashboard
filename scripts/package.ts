@@ -257,9 +257,19 @@ for (const t of targets) {
 
   const out = path.join(outDir, `aidlc-dashboard-${version}-${t.os}-${t.arch}.zip`);
   fs.rmSync(out, { force: true });
-  const zip = spawnSync("zip", ["-rq", out, "aidlc-dashboard"], { cwd: path.dirname(stage) });
+  // Windows has no `zip`; its own `tar.exe` (bsdtar, in Windows 10 1803+ and Server 2019+)
+  // writes the zip format. Measured 2026-11-20: the README's Windows install stopped here
+  // with "zip failed:" and nothing after it — the spawn error was not in the message.
+  const [cmd, cmdArgs]: [string, string[]] =
+    process.platform === "win32"
+      ? ["tar", ["--format=zip", "-cf", out, "aidlc-dashboard"]]
+      : ["zip", ["-rq", out, "aidlc-dashboard"]];
+  const zip = spawnSync(cmd, cmdArgs, { cwd: path.dirname(stage) });
   if (zip.status !== 0)
-    fail(`zip failed (${t.os}-${t.arch}): ${zip.stderr?.toString() ?? ""}`, work);
+    fail(
+      `zip failed (${t.os}-${t.arch}, ${cmd}): ${zip.error?.message ?? zip.stderr?.toString() ?? `exit ${zip.status}`}`,
+      work,
+    );
   written.push(out);
 }
 fs.rmSync(work, { recursive: true, force: true });
