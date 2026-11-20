@@ -74,7 +74,7 @@ earlier builds):
 
 ```bash
 cd ~/sample-aidlc-dashboard
-bun run package dist --only linux-x64
+bun run package dist --only linux-x64 --local
 AIDLC_ARCHIVE="$(ls -t dist/aidlc-dashboard-*-linux-x64.zip | head -n 1)" sh install.sh
 ```
 
@@ -85,7 +85,7 @@ In PowerShell, paste:
 ```powershell
 git clone https://github.com/aws-samples/sample-aidlc-dashboard.git "$HOME\sample-aidlc-dashboard"
 cd "$HOME\sample-aidlc-dashboard"
-bun run package dist --only windows-x64
+bun run package dist --only windows-x64 --local
 $env:AIDLC_ARCHIVE = (Get-ChildItem dist\aidlc-dashboard-*-windows-x64.zip | Sort-Object LastWriteTime | Select-Object -Last 1).FullName
 Get-Content -Raw .\install.ps1 | iex
 ```

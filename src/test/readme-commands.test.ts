@@ -45,6 +45,16 @@ describe("README command blocks paste as they are", () => {
       });
     }
   }
+  // A build in README is installed by the reader on their own machine, so it must skip the
+  // release's content audit: that audit matches the BUILDER's account name, and on a Windows
+  // box `Administrator` hit README's "administrator rights" and stopped the install (2026-11-20).
+  test("every README build passes --local", () => {
+    const builds = COMMAND_BLOCKS.flatMap((b) =>
+      b.body.split("\n").filter((l) => /\bbun run package\b/.test(l)),
+    );
+    expect(builds.length).toBeGreaterThan(0);
+    for (const line of builds) expect(line).toContain("--local");
+  });
   test("the install block ends by putting the launcher on this terminal's PATH", () => {
     const install = COMMAND_BLOCKS.find(
       (b) => b.body.includes("install.sh") && b.body.includes("git clone"),
